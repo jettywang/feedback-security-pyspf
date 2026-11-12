@@ -3,6 +3,12 @@ Version 2.1.0
   * Require ipaddress instead of ipaddr for python2
   * Fix issue Getting list of ip networks fails if prefix is 32 or more,
     GitHub #24
+  * Add call-level ExplanationPolicy (spf.ExplanationPolicy, exp_policy
+    parameter of spf.query and spf.check2) to control how much sender
+    identity appears in exp= text and SMTP explanations: optional
+    disabling of exp= DNS lookups, redaction of display-only macros,
+    control character sanitizing, and escape-safe truncation.  The SPF
+    result is never affected.
 
 Version 2.0.14 - January 1, 2020
   * Fix doctest for CNAME fixes to work with python and python3

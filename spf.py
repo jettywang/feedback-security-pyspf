@@ -243,6 +243,86 @@ EXPLANATIONS = {'pass': 'sender SPF authorized',
                 'ambiguous': 'No error, but results may vary'
         }
 
+# Macros are expanded in two distinct contexts:
+#
+# DNS-query macros: any macro appearing in a domain-spec (the domain part
+# of the a, mx, ptr, exists and include mechanisms, and of the redirect=
+# and exp= modifiers).  These expansions determine which DNS names are
+# queried, so they are always expanded in full - restricting them would
+# change the SPF result.  The 'p' macro additionally triggers validated
+# PTR lookups wherever it appears.
+#
+# Display-only macros: macros appearing in the TXT content fetched via
+# exp= (the only place the 'c', 'r' and 't' macros are legal).  This text
+# is shown to the sender in SMTP replies and Received-SPF comments, so it
+# is subject to the redaction, sanitizing and truncation rules of the
+# query's ExplanationPolicy.
+class ExplanationPolicy(object):
+    """Call-level policy for SPF explanations returned to senders.
+
+    Controls how much sender identity leaks into exp= text and SMTP
+    explanations, without affecting the SPF result in any way:
+
+    lookup_exp: perform the exp= TXT DNS lookup at all.  When False,
+        no explanation DNS queries are sent and the built-in default
+        explanations are used.  The SPF result is unchanged.
+    redact_macros: macro letters (e.g. 's', 'l', 'o', 'i', 'c', 'h', 'p')
+        whose values are replaced with a placeholder when expanding
+        display-only exp= text.  Redacting 'p' also avoids the validated
+        PTR lookups it would otherwise trigger.  DNS-query macros (in
+        domain-specs) are never redacted.
+    max_length: maximum length of the external explanation.  Truncation
+        never splits a '%XX' percent-escape into an incomplete sequence.
+    sanitize_controls: replace ASCII control characters (including CR and
+        LF) with spaces so explanations cannot inject extra SMTP response
+        lines or header lines.
+
+    The default policy reproduces historic pyspf behaviour.  Use
+    ExplanationPolicy.privacy() for a gateway-safe preset.
+    """
+    def __init__(self, lookup_exp=True, redact_macros=(), max_length=None,
+                 sanitize_controls=False):
+        self.lookup_exp = lookup_exp
+        self.redact_macros = frozenset(m.lower() for m in redact_macros)
+        self.max_length = max_length
+        self.sanitize_controls = sanitize_controls
+
+    @classmethod
+    def privacy(cls, max_length=128):
+        """Preset that hides sender identity from external explanations."""
+        return cls(lookup_exp=True, max_length=max_length,
+                   redact_macros='sloichprt', sanitize_controls=True)
+
+    def redact(self, letter):
+        "Return placeholder for a redacted display macro, or None."
+        if letter.lower() in self.redact_macros:
+            return '<%s-hidden>' % letter.lower()
+        return None
+
+    def finalize(self, text):
+        "Sanitize control characters and truncate explanation text."
+        if text is None:
+            return text
+        if self.sanitize_controls:
+            text = _sanitize_explanation(text)
+        return _truncate_explanation(text, self.max_length)
+
+def _sanitize_explanation(text):
+    "Replace ASCII control characters with spaces."
+    return ''.join(ch if ' ' <= ch <= '~' else ' ' for ch in text)
+
+def _truncate_explanation(text, maxlen):
+    """Truncate to maxlen without splitting a '%XX' percent-escape
+    into an incomplete sequence."""
+    if maxlen is None or len(text) <= maxlen:
+        return text
+    cut = text[:maxlen]
+    if cut.endswith('%'):
+        cut = cut[:-1]
+    elif len(cut) >= 2 and cut[-2] == '%':
+        cut = cut[:-2]
+    return cut
+
 DELEGATE = None
 
 # standard default SPF record for best_guess
@@ -304,7 +384,7 @@ class PermError(Exception):
             return '%s: %s'%(self.msg, self.mech)
         return self.msg
 
-def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME, verbose=False, querytime=20):
+def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME, verbose=False, querytime=20, exp_policy=None):
     """Test an incoming MAIL FROM:<s>, from a client with ip address i.
     h is the HELO/EHLO domain name.  This is the RFC4408/7208 compliant
     pySPF2.0 interface.  The interface returns an SPF result and explanation
@@ -316,7 +396,9 @@ def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME, verb
     controls the time allowed for each DNS lookup.  When set to a non-zero
     value, it total time for all processing related to the SPF check is
     limited to querytime (default 20 seconds as recommended in RFC 7208,
-    paragraph 4.6.4).
+    paragraph 4.6.4).  The exp_policy parameter takes an ExplanationPolicy
+    instance controlling how much sender identity appears in the returned
+    explanation; it never affects the SPF result.
 
     Returns (result, explanation) where result in
     ['pass', 'permerror', 'fail', 'temperror', 'softfail', 'none', 'neutral' ].
@@ -326,7 +408,8 @@ def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME, verb
 
     """
     res,_,exp = query(i=i, s=s, h=h, local=local,
-        receiver=receiver,timeout=timeout,verbose=verbose,querytime=querytime).check()
+        receiver=receiver,timeout=timeout,verbose=verbose,querytime=querytime,
+        exp_policy=exp_policy).check()
     return res,exp
 
 def check(i, s, h, local=None, receiver=None, verbose=False):
@@ -373,7 +456,8 @@ class query(object):
     Also keeps cache: DNS cache.  
     """
     def __init__(self, i, s, h, local=None, receiver=None, strict=True,
-                timeout=MAX_PER_LOOKUP_TIME,verbose=False,querytime=0):
+                timeout=MAX_PER_LOOKUP_TIME,verbose=False,querytime=0,
+                exp_policy=None):
         self.s, self.h = s, h
         if not s and h:
             self.s = 'postmaster@' + h
@@ -420,6 +504,9 @@ class query(object):
         self.default_modifier = True
         self.verbose = verbose
         self.authserv = None # Only used in A-R header generation tests
+        if exp_policy is None:
+            exp_policy = ExplanationPolicy()
+        self.exp_policy = exp_policy
 
     def log(self,mech,d,spf):
         print('%s: %s "%s"'%(mech,d,spf))
@@ -888,11 +975,12 @@ class query(object):
                 # just use last one in lax mode
             modifiers.append(mod)
             if mod == 'exp':
-                # always fetch explanation to check permerrors
+                # always fetch explanation to check permerrors, unless
+                # the explanation policy disables exp= DNS lookups
                 if not arg:
                     raise PermError('exp has empty domain-spec:',arg)
                 arg = self.expand_domain(arg)
-                if arg:
+                if arg and self.exp_policy.lookup_exp:
                     try:
                         exp = self.get_explanation(arg)
                         if exp and not recursion:
@@ -1000,9 +1088,9 @@ class query(object):
         if not recursion:       # record matching mechanism at base level
             self.mechanism = mech
         if result == 'fail':
-            return (result, 550, exps[result])
+            return (result, 550, self.exp_policy.finalize(exps[result]))
         else:
-            return (result, 250, exps[result])
+            return (result, 250, self.exp_policy.finalize(exps[result]))
 
     def check_lookups(self):
         self.lookups = self.lookups + 1
@@ -1017,7 +1105,11 @@ class query(object):
             try:
                 a = self.dns_txt(spec,ignore_void=True)
                 if len(a) == 1:
-                    return str(self.expand(to_ascii(a[0]), stripdot=False))
+                    # display-only expansion: redaction, sanitizing and
+                    # truncation are applied by the explanation policy
+                    exp = self.expand(to_ascii(a[0]), stripdot=False,
+                        display=True)
+                    return str(self.exp_policy.finalize(exp))
             except PermError:
                 # RFC4408 6.2/4 syntax errors cause exp= to be ignored
                 if self.strict > 1:
@@ -1029,7 +1121,7 @@ class query(object):
         # (unless you give precedence to the grammar).
         return None
 
-    def expand(self, s, stripdot=True): # macros='slodipvh'
+    def expand(self, s, stripdot=True, display=False): # macros='slodipvh'
         """Do SPF RFC macro expansion.
 
         Examples:
@@ -1138,6 +1230,16 @@ class query(object):
             else:
                 letter = macro[2].lower()
 #                print(letter)
+                placeholder = None
+                if display:
+                    # display-only text (exp= content): the explanation
+                    # policy may hide sensitive identities.  Redacting 'p'
+                    # also avoids its validated PTR DNS lookups.
+                    placeholder = self.exp_policy.redact(letter)
+                if placeholder is not None:
+                    result += placeholder
+                    end = i.end()
+                    continue
                 if letter == 'p':
                     self.getp()
                 elif letter in 'crt' and stripdot:
