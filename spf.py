@@ -626,6 +626,11 @@ class query(object):
             # Pre-Lentczner draft treats this as an unknown result
             # and equivalent to no SPF record.
             return ('permerror', 550, 'SPF Permanent Error: ' + str(x))
+        except AmbiguityWarning as x:
+            self.prob = x.msg
+            if x.mech:
+                self.mech.append(x.mech)
+            return ('ambiguous', 000, 'SPF Ambiguity Warning: %s' % x)
 
     def check1(self, spf, domain, recursion):
         # spf rfc: 3.7 Processing Limits
@@ -1225,10 +1230,11 @@ class query(object):
               if dns_list:
                   # a[0][:0] is '' for py3dns-3.0.2, otherwise b''
                   a = [a[0][:0].join(a) for a in dns_list if a]
-                  # FIXME: workaround for error in py3dns-3.0.2
-                  if isinstance(a[0],bytes):
-                      return a
-                  return [s.encode('utf-8') for s in a]
+                  if a:
+                      # FIXME: workaround for error in py3dns-3.0.2
+                      if isinstance(a[0],bytes):
+                          return a
+                      return [s.encode('utf-8') for s in a]
           # FIXME: workaround for error in py3dns-3.0.2
           except UnicodeError:
               raise PermError('Non-ascii characters found in %s record for %s'

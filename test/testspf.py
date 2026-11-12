@@ -53,7 +53,7 @@ def DNSLookup(name,qtype,strict=True,timeout=None,level=0):
       if t == 'AAAA':
         v = bytes(socket.inet_pton(socket.AF_INET6,v))
       elif t in ('TXT','SPF'):
-        v = tuple([s.encode('utf-8') for s in v])
+        v = tuple([s.encode('utf-8') if isinstance(s,str) else s for s in v])
       yield ((n,t),v)
       # emulate CNAME additional info for 1 level
       if not level and t == 'CNAME':
@@ -218,6 +218,126 @@ class SPFTestCases(unittest.TestCase):
     res,code,txt = q.check('v=spf1...')
     self.assertEqual('ambiguous',res)
 
+class TxtRecordMatrix(unittest.TestCase):
+  """Verify unique SPF policy selection with fragmented TXT records,
+  multiple TXT records, and non-ascii/binary unrelated records mixed in.
+  """
+
+  ZONE = {
+    # one policy split into 3 character-strings (fragments)
+    'frag.example.com':
+      [('TXT', ('v=spf1 ip4:', '1.2.3.0/24 ', '-all'))],
+    # fragments including an empty one still glue to a single policy
+    'fragempty.example.com':
+      [('TXT', ('v=spf1 ', '', 'ip4:1.2.3.0/24 -all'))],
+    # two genuine policies: ambiguity, not concatenation
+    'multi.example.com':
+      [('TXT', ('v=spf1 ip4:1.2.3.0/24 -all',)), ('TXT', ('v=spf1 ~all',))],
+    # unrelated binary TXT must not shadow the legit policy
+    'mixedbin.example.com':
+      [('TXT', ('v=spf1 ip4:1.2.3.0/24 -all',)), ('TXT', (b'\xff\xfe\x00bin',))],
+    # unrelated non-ascii TXT must not shadow the legit policy
+    'mixedutf.example.com':
+      [('TXT', ('v=spf1 ip4:1.2.3.0/24 -all',)), ('TXT', ('café ✓ not spf',))],
+    # v=spf1 is case insensitive
+    'case.example.com':
+      [('TXT', ('V=SPF1 ip4:1.2.3.0/24 -ALL',))],
+    # corrupted bytes inside an SPF record: permerror, not silent accept
+    'corrupt.example.com':
+      [('TXT', (b'v=spf1 ', b'\xffall'))],
+    # null-text (no character-strings) is illegal but must not crash
+    'nullonly.example.com':
+      [('TXT', ())],
+    # empty-string fragment record is ignored, legit policy still found
+    'emptystr.example.com':
+      [('TXT', ('',)), ('TXT', ('v=spf1 ip4:1.2.3.0/24 -all',))],
+    # strict=2: type TXT and type SPF (99) diverge -> ambiguous
+    't99diff.example.com':
+      [('TXT', ('v=spf1 ip4:1.2.3.0/24 -all',)), ('SPF', ('v=spf1 ~all',))],
+    # strict=2: identical TXT and SPF records -> ok
+    't99same.example.com':
+      [('TXT', ('v=spf1 ip4:1.2.3.0/24 -all',)), ('SPF', ('v=spf1 ip4:1.2.3.0/24 -all',))],
+    # strict=2: type SPF (99) only -> used
+    't99only.example.com':
+      [('SPF', ('v=spf1 ip4:1.2.3.0/24 -all',))],
+  }
+
+  def setUp(self):
+    global zonedata
+    self.savezonedata = zonedata
+    zonedata = dict(
+      (d, [(t, v, d) for t, v in rrs]) for d, rrs in self.ZONE.items())
+
+  def tearDown(self):
+    global zonedata
+    zonedata = self.savezonedata
+
+  def query(self, domain, strict=True):
+    return spf.query(i='1.2.3.4', s='x@'+domain, h=domain, strict=strict)
+
+  def check(self, domain, strict=True):
+    return self.query(domain, strict).check()
+
+  def testFragmentedRecordIsSinglePolicy(self):
+    q = self.query('frag.example.com')
+    self.assertEqual(q.dns_txt('frag.example.com'),
+                     [b'v=spf1 ip4:1.2.3.0/24 -all'])
+    self.assertEqual(q.dns_spf('frag.example.com'),
+                     'v=spf1 ip4:1.2.3.0/24 -all')
+    res, code, exp = self.check('frag.example.com')
+    self.assertEqual('pass', res)
+
+  def testEmptyFragmentGlued(self):
+    res, code, exp = self.check('fragempty.example.com')
+    self.assertEqual('pass', res)
+
+  def testMultiplePoliciesPermError(self):
+    q = self.query('multi.example.com')
+    self.assertRaises(spf.PermError, q.dns_spf, 'multi.example.com')
+    res, code, exp = self.check('multi.example.com')
+    self.assertEqual('permerror', res)
+
+  def testBinaryTxtDoesNotShadow(self):
+    q = self.query('mixedbin.example.com')
+    self.assertEqual(q.dns_spf('mixedbin.example.com'),
+                     'v=spf1 ip4:1.2.3.0/24 -all')
+    res, code, exp = self.check('mixedbin.example.com')
+    self.assertEqual('pass', res)
+
+  def testNonAsciiTxtDoesNotShadow(self):
+    res, code, exp = self.check('mixedutf.example.com')
+    self.assertEqual('pass', res)
+
+  def testCaseInsensitiveVersion(self):
+    res, code, exp = self.check('case.example.com')
+    self.assertEqual('pass', res)
+
+  def testCorruptSpfBytesPermError(self):
+    res, code, exp = self.check('corrupt.example.com')
+    self.assertEqual('permerror', res)
+
+  def testNullTextOnlyRecord(self):
+    q = self.query('nullonly.example.com')
+    self.assertEqual(q.dns_txt('nullonly.example.com'), [])
+    res, code, exp = self.check('nullonly.example.com')
+    self.assertEqual('none', res)
+
+  def testEmptyStringFragmentIgnored(self):
+    res, code, exp = self.check('emptystr.example.com')
+    self.assertEqual('pass', res)
+
+  def testHarshTxtSpfDivergence(self):
+    res, code, exp = self.check('t99diff.example.com', strict=2)
+    self.assertEqual('ambiguous', res)
+
+  def testHarshTxtSpfIdentical(self):
+    res, code, exp = self.check('t99same.example.com', strict=2)
+    self.assertEqual('pass', res)
+
+  def testHarshSpfOnly(self):
+    res, code, exp = self.check('t99only.example.com', strict=2)
+    self.assertEqual('pass', res)
+
 def makeSuite(filename):
   suite = unittest.TestSuite()
   for t in loadYAML(filename).values():
@@ -226,6 +346,7 @@ def makeSuite(filename):
 
 def docsuite():
   suite = unittest.defaultTestLoader.loadTestsFromTestCase(SPFTestCases)
+  suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TxtRecordMatrix))
   try:
     import authres
   except:
