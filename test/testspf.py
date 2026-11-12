@@ -207,6 +207,189 @@ class SPFTestCase(unittest.TestCase):
       if verbose > 1: msg += t.scenario.zonedata
       self.fail(msg+"%s in %s failed, %s" % (t.id,t.scenario.filename,t.spec))
 
+class DNSAdditionalCacheTests(unittest.TestCase):
+  """Regression tests for reuse of DNS additional data.
+
+  A resolver response can mix answer records with additional records for
+  unrelated owners.  Only records attributable to the queried name (or,
+  for MX, to an exchange in the queried zone) may enter the session cache.
+  """
+
+  def setUp(self):
+    self.save_lookup = spf.DNSLookup
+    self.zone = {}
+    self.calls = []
+
+  def tearDown(self):
+    spf.DNSLookup = self.save_lookup
+
+  def add(self, name, qtype, *records):
+    self.zone[(name.lower(), qtype)] = list(records)
+
+  def install(self):
+    zone, calls = self.zone, self.calls
+    def fake(name, qtype, strict=True, timeout=None):
+      calls.append((name.lower(), qtype))
+      return zone.get((name.lower(), qtype), [])
+    spf.DNSLookup = fake
+
+  def check(self, ip, sender, strict=True):
+    self.install()
+    q = spf.query(i=ip, s=sender, h='mail.example.com', strict=strict)
+    return q, q.check()
+
+  def test_cname_additional_cannot_reauthorize(self):
+    # The attacker's include response carries a CNAME for an unrelated
+    # trusted domain.  If that CNAME is cached, a:trusted.example follows
+    # it to attacker-pool.example and wrongly passes.
+    self.add('victim.example', 'TXT',
+        (('victim.example', 'TXT'), (b'v=spf1 include:attacker.example a:trusted.example -all',)))
+    self.add('attacker.example', 'TXT',
+        (('attacker.example', 'TXT'), (b'v=spf1 ip4:203.0.113.1 -all',)),
+        (('trusted.example', 'CNAME'), 'attacker-pool.example'))
+    self.add('attacker-pool.example', 'A',
+        (('attacker-pool.example', 'A'), '192.0.2.66'))
+    self.add('trusted.example', 'A',
+        (('trusted.example', 'A'), '198.51.100.10'))
+    q, (res, code, exp) = self.check('192.0.2.66', 'u@victim.example')
+    self.assertEqual('fail', res)
+    self.assertNotIn(('trusted.example', 'CNAME'), q.cache)
+    self.assertEqual(['198.51.100.10'], q.cache[('trusted.example', 'A')])
+
+  def test_txt_additional_cannot_reauthorize(self):
+    # Minimal fail -> pass sample: the attacker's own SPF TXT response
+    # carries an SPF TXT for an unrelated trusted domain.  Reusing that
+    # record as the answer to include:trusted.example authorizes the
+    # attacker.
+    self.add('victim.example', 'TXT',
+        (('victim.example', 'TXT'),
+         (b'v=spf1 include:attacker.example include:trusted.example -all',)))
+    self.add('attacker.example', 'TXT',
+        (('attacker.example', 'TXT'), (b'v=spf1 ip4:203.0.113.1 -all',)),
+        (('trusted.example', 'TXT'), (b'v=spf1 ip4:192.0.2.66 -all',)))
+    self.add('trusted.example', 'TXT',
+        (('trusted.example', 'TXT'), (b'v=spf1 ip4:198.51.100.10 -all',)))
+    q, (res, code, exp) = self.check('192.0.2.66', 'u@victim.example')
+    self.assertEqual('fail', res)
+    self.assertEqual([(b'v=spf1 ip4:198.51.100.10 -all',)],
+                     q.cache[('trusted.example', 'TXT')])
+
+  def test_mx_rr_additional_cannot_reauthorize(self):
+    # A TXT response that carries an MX for another domain must not seed
+    # a later mx: query for that domain.
+    self.add('victim.example', 'TXT',
+        (('victim.example', 'TXT'), (b'v=spf1 include:attacker.example mx:trusted.example -all',)))
+    self.add('attacker.example', 'TXT',
+        (('attacker.example', 'TXT'), (b'v=spf1 ip4:203.0.113.1 -all',)),
+        (('trusted.example', 'MX'), (10, 'mail.attacker.example')))
+    self.add('trusted.example', 'MX',
+        (('trusted.example', 'MX'), (10, 'mail.trusted.example')))
+    self.add('mail.attacker.example', 'A',
+        (('mail.attacker.example', 'A'), '192.0.2.66'))
+    self.add('mail.trusted.example', 'A',
+        (('mail.trusted.example', 'A'), '198.51.100.10'))
+    q, (res, code, exp) = self.check('192.0.2.66', 'u@victim.example')
+    self.assertEqual('fail', res)
+    self.assertEqual([(10, 'mail.trusted.example')],
+                     q.cache[('trusted.example', 'MX')])
+
+  def test_ptr_additional_cannot_reauthorize(self):
+    # The PTR answer is controlled by the client; it must not smuggle a
+    # CNAME for a domain the client does not control.  If that alias were
+    # cached, the later a:trusted.example lookup would follow it to the
+    # attacker's pool and wrongly pass.
+    self.add('victim.example', 'TXT',
+        (('victim.example', 'TXT'), (b'v=spf1 ptr:trusted.example a:trusted.example -all',)))
+    self.add('66.2.0.192.in-addr.arpa', 'PTR',
+        (('66.2.0.192.in-addr.arpa', 'PTR'), 'client.attacker.example'),
+        (('trusted.example', 'CNAME'), 'attacker-pool.example'))
+    self.add('client.attacker.example', 'A',
+        (('client.attacker.example', 'A'), '192.0.2.66'))
+    self.add('attacker-pool.example', 'A',
+        (('attacker-pool.example', 'A'), '192.0.2.66'))
+    self.add('trusted.example', 'A',
+        (('trusted.example', 'A'), '198.51.100.10'))
+    q, (res, code, exp) = self.check('192.0.2.66', 'u@victim.example')
+    self.assertEqual('fail', res)
+    self.assertNotIn(('trusted.example', 'CNAME'), q.cache)
+    self.assertEqual(['198.51.100.10'], q.cache[('trusted.example', 'A')])
+
+  def test_mx_exchange_additional_outside_bailiwick(self):
+    # The attacker's own MX response names an exchange in another zone
+    # and supplies its address.  That address is not attributable to the
+    # attacker's authority, so a later a:trusted.example must look it up.
+    self.add('victim.example', 'TXT',
+        (('victim.example', 'TXT'), (b'v=spf1 mx:attacker.example a:trusted.example -all',)))
+    self.add('attacker.example', 'MX',
+        (('attacker.example', 'MX'), (10, 'trusted.example')),
+        (('trusted.example', 'A'), '192.0.2.66'))
+    self.add('trusted.example', 'A',
+        (('trusted.example', 'A'), '198.51.100.10'))
+    q, (res, code, exp) = self.check('192.0.2.66', 'u@victim.example')
+    self.assertEqual('fail', res)
+    self.assertEqual(['198.51.100.10'], q.cache[('trusted.example', 'A')])
+
+  def test_same_owner_other_type_is_keyed_and_not_reused(self):
+    # A TXT response for attacker.example also carries an A for the same
+    # owner.  Record types have separate cache keys and the A is not
+    # treated as an answer to a later A query for that name.
+    self.add('victim.example', 'TXT',
+        (('victim.example', 'TXT'), (b'v=spf1 include:attacker.example a:attacker.example -all',)))
+    self.add('attacker.example', 'TXT',
+        (('attacker.example', 'TXT'), (b'v=spf1 ip4:203.0.113.1 -all',)),
+        (('attacker.example', 'A'), '192.0.2.66'))
+    self.add('attacker.example', 'A',
+        (('attacker.example', 'A'), '198.51.100.10'))
+    q, (res, code, exp) = self.check('192.0.2.66', 'u@victim.example')
+    self.assertEqual('fail', res)
+    self.assertIn(('attacker.example', 'TXT'), q.cache)
+    self.assertEqual(['198.51.100.10'], q.cache[('attacker.example', 'A')])
+    self.assertIn(('attacker.example', 'A'), self.calls)
+
+  def test_case_normalized_cache_keys(self):
+    # Mixed-case owners and CNAME targets must normalize to one key so a
+    # second query cannot observe a differently-cased poisoned entry.
+    self.add('victim.example', 'TXT',
+        (('victim.example', 'TXT'), (b'v=spf1 include:attacker.example a:trusted.example -all',)))
+    self.add('attacker.example', 'TXT',
+        (('attacker.example', 'TXT'), (b'v=spf1 ip4:203.0.113.1 -all',)),
+        (('TRUSTED.Example.', 'CNAME'), 'ATTACKER-POOL.Example.'))
+    self.add('attacker-pool.example', 'A',
+        (('attacker-pool.example', 'A'), '192.0.2.66'))
+    self.add('trusted.example', 'A',
+        (('trusted.example', 'A'), '198.51.100.10'))
+    q, (res, code, exp) = self.check('192.0.2.66', 'u@victim.example')
+    self.assertEqual('fail', res)
+    self.assertFalse([k for k in q.cache if k[0] != k[0].lower()])
+    self.assertEqual(['198.51.100.10'], q.cache[('trusted.example', 'A')])
+
+  def test_cname_chain_still_followed(self):
+    # A legitimate CNAME chain for the queried name still resolves.
+    self.add('victim.example', 'TXT',
+        (('victim.example', 'TXT'), (b'v=spf1 a:alias.example -all',)))
+    self.add('alias.example', 'A',
+        (('ALIAS.Example.', 'CNAME'), 'real.example.'))
+    self.add('real.example', 'A',
+        (('REAL.Example.', 'A'), '192.0.2.66'))
+    q, (res, code, exp) = self.check('192.0.2.66', 'u@victim.example')
+    self.assertEqual('pass', res)
+    self.assertEqual(['real.example'], q.cache[('alias.example', 'CNAME')])
+
+  def test_mx_exchange_additional_reused(self):
+    # Legitimate: the MX answer and an A for its exchange share one
+    # response and the address is in the queried zone.  No second query.
+    self.add('victim.example', 'TXT',
+        (('victim.example', 'TXT'), (b'v=spf1 mx -all',)))
+    self.add('victim.example', 'MX',
+        (('victim.example', 'MX'), (10, 'mail.victim.example')),
+        (('mail.victim.example', 'A'), '192.0.2.66'))
+    q, (res, code, exp) = self.check('192.0.2.66', 'u@victim.example')
+    self.assertEqual('pass', res)
+    self.assertEqual([('victim.example', 'TXT'), ('victim.example', 'MX')], self.calls)
+    self.assertEqual(['192.0.2.66'], q.cache[('mail.victim.example', 'A')])
+
+
+
 class SPFTestCases(unittest.TestCase):
 
   def testInvalidSPF(self):
@@ -226,6 +409,8 @@ def makeSuite(filename):
 
 def docsuite():
   suite = unittest.defaultTestLoader.loadTestsFromTestCase(SPFTestCases)
+  suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(
+      DNSAdditionalCacheTests))
   try:
     import authres
   except:

@@ -1301,10 +1301,17 @@ class query(object):
 
     # We have to be careful which additional DNS RRs we cache.  For
     # instance, PTR records are controlled by the connecting IP, and they
-    # could poison our local cache with bogus A and MX records.  
+    # could poison our local cache with bogus A and MX records.
+    #
+    # SAFE2CACHE only describes which record types are useful for a given
+    # query type.  dns() additionally requires the record owner to be the
+    # name being queried (or, for MX, an exchange named by the MX answer).
+    # A record for any other owner is additional data from a zone we did
+    # not ask about and must not authorize a later, unrelated lookup.
 
     SAFE2CACHE = {
       ('MX','A'): None,
+      ('MX','AAAA'): None,
       ('MX','MX'): None,
       ('CNAME','A'): None,
       ('A','A'): None,
@@ -1356,6 +1363,9 @@ class query(object):
 
         if cname:
             cname = cname[0]
+            if not isinstance(cname, str):
+                cname = str(cname)
+            cname = cname.lower().rstrip('.')
         else:
             safe2cache = query.SAFE2CACHE
             if self.querytime < 0:
@@ -1365,20 +1375,64 @@ class query(object):
             else:
                 timeout = self.timeout
             timethen = time.time()
+            # Collect the response before caching.  An answer may include
+            # records for unrelated owners (additional data), and we can
+            # only decide whether those are safe after seeing the actual
+            # answer records (in particular the MX exchanges).
+            records = []
             for k, v in DNSLookup(name, qtype, self.strict, timeout):
                 if debug: print('result=',k,v)
                 # Force case insensitivity in cache, DNS servers often
                 # return random case in domain part of answers.
-                k = (k[0].lower(), k[1]) 
+                records.append(
+                  ((k[0].lower().rstrip('.'), str(k[1]).upper()), v))
+            def normalize_cname(value):
+                if value is None:
+                    return value
+                if isinstance(value, bytes):
+                    value = value.decode('ascii', 'replace')
+                elif not isinstance(value, str):
+                    value = str(value)
+                return value.lower().rstrip('.')
+            mx_exchanges = set()
+            for k, v in records:
+                if qtype == 'MX' and k[0] == name and k[1] == 'MX':
+                    try:
+                        exchange = v[1]
+                    except (IndexError, TypeError):
+                        continue
+                    if exchange:
+                        mx_exchanges.add(str(exchange).lower().rstrip('.'))
+            for k, v in records:
                 if k == cnamek:
-                    cname = v
+                    # Follow CNAMEs, but only cache the alias for the name
+                    # we actually queried.  A CNAME for any other owner in
+                    # this response (e.g. from a PTR or TXT response) must
+                    # not enter the session cache.
+                    cname = normalize_cname(v)
                     result = self.cache.get( (cname, qtype), [])
                     if result: break
-                if k[1] == 'CNAME' or (qtype,k[1]) in safe2cache:
+                cacheable = False
+                if k[1] == 'CNAME':
+                    cacheable = (k[0] == name)
+                elif k[0] == name and (
+                      k[1] == qtype or (qtype, k[1]) in safe2cache):
+                    cacheable = True
+                elif (qtype == 'MX' and k[0] in mx_exchanges
+                      and k[1] in ('A', 'AAAA')
+                      and (k[0] == name
+                           or k[0].endswith('.' + name))):
+                    # Additional addresses for an exchange named by the
+                    # MX answer are reusable only when the exchange is in
+                    # the bailiwick of the queried name.  An exchange
+                    # outside that zone is controlled by a different
+                    # authority and its address must be looked up afresh.
+                    cacheable = True
+                if cacheable:
+                    if k[1] == 'CNAME':
+                        v = normalize_cname(v)
                     if debug: print('addcache=',k,v)
                     self.cache.setdefault(k, []).append(v)
-                    #if ans and qtype == k[1]:
-                    #    self.cache.setdefault((name,qtype), []).append(v)
             result = self.cache.get( (name, qtype), [])
             if self.querytime > 0:
                 self.querytime = self.querytime - (time.time()-timethen)
