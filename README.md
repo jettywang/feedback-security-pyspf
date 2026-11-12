@@ -178,6 +178,28 @@ spf.MAX_PER_LOOKUP_TIME.  RFC 4408 says that the overall limit MAY be used and
 recommends no less than 20 seconds if it is. RFC 7208 is stronger, so a
 default limit aligned to the RFC requirements is now used.
 
+A per-check DNS resolver can be supplied without touching the module level
+spf.DNSLookup hook, which is useful when one process serves several tenants
+that need different DNS views::
+
+        >>> import spf
+        >>> def my_resolver(name, qtype, strict=True, timeout=None):
+        ...     # Must yield ((fqdn, qtype), value) pairs like spf.DNSLookup.
+        ...     return spf.DNSLookup(name, qtype, strict, timeout)
+        >>> q = spf.query(i='192.0.2.3', s='user@example.com',
+        ...               h='mx.example.com', resolver=my_resolver)
+        >>> spf.check2(i='192.0.2.3', s='user@example.com',
+        ...            h='mx.example.com', resolver=my_resolver)
+        ('pass', 'sender SPF authorized')
+
+The resolver is used for every query made by that check, including recursive
+include/redirect processing and exp= explanations.  Each query object keeps its
+own DNS cache and querytime budget, so checks for different tenants can be
+interleaved in one process.  The resolver parameter defaults to None, which
+keeps using the module level DNSLookup.  A resolver exception while producing
+or iterating answers produces a temperror (an error, not an empty answer);
+returning no answers is a real "none"/void result per SPF semantics.
+
 License: Python Software Foundation License
 
 Author:

@@ -304,7 +304,8 @@ class PermError(Exception):
             return '%s: %s'%(self.msg, self.mech)
         return self.msg
 
-def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME, verbose=False, querytime=20):
+def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME,
+           verbose=False, querytime=20, resolver=None):
     """Test an incoming MAIL FROM:<s>, from a client with ip address i.
     h is the HELO/EHLO domain name.  This is the RFC4408/7208 compliant
     pySPF2.0 interface.  The interface returns an SPF result and explanation
@@ -318,6 +319,12 @@ def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME, verb
     limited to querytime (default 20 seconds as recommended in RFC 7208,
     paragraph 4.6.4).
 
+    resolver, when given, is used for every DNS query made by this check
+    (including recursive include/redirect processing and exp= text).  It must
+    be callable with the same convention as DNSLookup:
+    resolver(name, qtype, strict, timeout) -> iterable of ((fqdn, type), value).
+    The module level DNSLookup is not changed and remains the default.
+
     Returns (result, explanation) where result in
     ['pass', 'permerror', 'fail', 'temperror', 'softfail', 'none', 'neutral' ].
 
@@ -325,16 +332,19 @@ def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME, verb
     #>>> check2(i='61.51.192.42', s='liukebing@bcc.com', h='bmsi.com')
 
     """
-    res,_,exp = query(i=i, s=s, h=h, local=local,
-        receiver=receiver,timeout=timeout,verbose=verbose,querytime=querytime).check()
+    res,_,exp = query(i=i, s=s, h=h, local=local, receiver=receiver,
+        timeout=timeout, verbose=verbose, querytime=querytime,
+        resolver=resolver).check()
     return res,exp
 
-def check(i, s, h, local=None, receiver=None, verbose=False):
+def check(i, s, h, local=None, receiver=None, verbose=False, resolver=None):
     """Test an incoming MAIL FROM:<s>, from a client with ip address i.
     h is the HELO/EHLO domain name.  This is the pre-RFC SPF Classic interface.
     Applications written for pySPF 1.6/1.7 can use this interface to allow
     pySPF2 to be a drop in replacement for older versions.  With the exception
     of result codes, performance in RFC 4408 compliant.
+
+    resolver is passed to query(), see check2() for its contract.
 
     Returns (result, code, explanation) where result in
     ['pass', 'unknown', 'fail', 'error', 'softfail', 'none', 'neutral' ].
@@ -344,7 +354,7 @@ def check(i, s, h, local=None, receiver=None, verbose=False):
 
     """
     res,code,exp = query(i=i, s=s, h=h, local=local, receiver=receiver,
-        verbose=verbose).check()
+        verbose=verbose, resolver=resolver).check()
     if res == 'permerror':
         res = 'unknown'
     elif res == 'tempfail':
@@ -373,7 +383,8 @@ class query(object):
     Also keeps cache: DNS cache.  
     """
     def __init__(self, i, s, h, local=None, receiver=None, strict=True,
-                timeout=MAX_PER_LOOKUP_TIME,verbose=False,querytime=0):
+                timeout=MAX_PER_LOOKUP_TIME,verbose=False,querytime=0,
+                resolver=None):
         self.s, self.h = s, h
         if not s and h:
             self.s = 'postmaster@' + h
@@ -388,6 +399,13 @@ class query(object):
             self.r = receiver
         else:
             self.r = 'unknown'
+        # resolver is used for every DNS query made while evaluating this
+        # query, including recursive includes/redirects and exp= lookups.
+        # It defaults to the module level DNSLookup so existing callers and
+        # the global hook keep working unchanged.
+        self.resolver = resolver
+        self.per_request_querytime = querytime
+        self._resolver_used = resolver
         # Since the cache does not track Time To Live, it is created
         # fresh for each query.  It is important for efficiently using
         # multiple results provided in DNS answers.
@@ -596,6 +614,14 @@ class query(object):
         self.mechanism = None
         self.void_lookups = 0
         self.options = {}
+
+        if self.resolver is not None and self.resolver is not self._resolver_used:
+            # A resolver switch on the same query object starts a new
+            # request: answers and the global time budget from the previous
+            # DNS view must not leak into the new one.
+            self.cache = {}
+            self.querytime = self.per_request_querytime
+            self._resolver_used = self.resolver
 
         try:
             self.lookups = 0
@@ -1364,21 +1390,39 @@ class query(object):
                 timeout = self.querytime
             else:
                 timeout = self.timeout
+            resolver = self.resolver if self.resolver is not None else DNSLookup
+            if not callable(resolver):
+                # Also accept resolver objects exposing a lookup() method.
+                resolver = getattr(resolver, 'lookup', None)
+                if resolver is None:
+                    raise TypeError(
+                        'resolver must be callable or have a lookup() method')
             timethen = time.time()
-            for k, v in DNSLookup(name, qtype, self.strict, timeout):
-                if debug: print('result=',k,v)
-                # Force case insensitivity in cache, DNS servers often
-                # return random case in domain part of answers.
-                k = (k[0].lower(), k[1]) 
-                if k == cnamek:
-                    cname = v
-                    result = self.cache.get( (cname, qtype), [])
-                    if result: break
-                if k[1] == 'CNAME' or (qtype,k[1]) in safe2cache:
-                    if debug: print('addcache=',k,v)
-                    self.cache.setdefault(k, []).append(v)
-                    #if ans and qtype == k[1]:
-                    #    self.cache.setdefault((name,qtype), []).append(v)
+            try:
+                answers = resolver(name, qtype, self.strict, timeout)
+                if answers is None:
+                    answers = ()
+                for k, v in answers:
+                    if debug: print('result=',k,v)
+                    # Force case insensitivity in cache, DNS servers often
+                    # return random case in domain part of answers.
+                    k = (k[0].lower(), k[1])
+                    if k == cnamek:
+                        cname = v
+                        result = self.cache.get( (cname, qtype), [])
+                        if result: break
+                    if k[1] == 'CNAME' or (qtype,k[1]) in safe2cache:
+                        if debug: print('addcache=',k,v)
+                        self.cache.setdefault(k, []).append(v)
+                        #if ans and qtype == k[1]:
+                        #    self.cache.setdefault((name,qtype), []).append(v)
+            except (TempError, PermError, AmbiguityWarning):
+                raise
+            except Exception as x:
+                # A caller supplied resolver need not know SPF exception
+                # types.  Errors while producing or iterating answers are a
+                # temporary DNS failure, never an empty (authoritative) reply.
+                raise TempError('DNS ' + str(x))
             result = self.cache.get( (name, qtype), [])
             if self.querytime > 0:
                 self.querytime = self.querytime - (time.time()-timethen)

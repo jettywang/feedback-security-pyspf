@@ -218,6 +218,188 @@ class SPFTestCases(unittest.TestCase):
     res,code,txt = q.check('v=spf1...')
     self.assertEqual('ambiguous',res)
 
+
+class FakeResolver(object):
+  """A callable DNS view for one tenant, recording every lookup it serves."""
+  def __init__(self, zone):
+    self.zone = zone
+    self.queries = []
+    self.raise_on = {}
+    self.raise_after = {}
+
+  def __call__(self, name, qtype, strict=True, timeout=None):
+    name = name.lower()
+    key = (name, qtype)
+    self.queries.append(key)
+    if key in self.raise_on:
+      raise self.raise_on[key]
+    for i, v in self.zone.get(name, []):
+      if i != qtype:
+        continue
+      if v == 'TIMEOUT':
+        raise spf.TempError('DNS timeout')
+      if qtype in ('TXT', 'SPF') and isinstance(v, tuple):
+        v = tuple(s.encode('utf-8') for s in v)
+      yield ((name, i), v)
+      if key in self.raise_after:
+        raise self.raise_after[key]
+
+
+# Tenant "blue" and tenant "green" publish the same record for the same
+# domain, but their DNS views provide opposite answers for every lookup.
+# include returns fail (neutral at the include site), then redirect= is
+# exercised; its mx and ptr lookups authorize only the blue client.
+TENANT_RECORD = ('v=spf1 include:inc.example.net'
+                 ' redirect=shared.example.net exp=exp.shared.example.net')
+BLUE_ZONE = {
+  'tenant.example.com': [('TXT', (TENANT_RECORD,))],
+  'inc.example.net': [('TXT', ('v=spf1 -all',))],
+  'shared.example.net': [('TXT', ('v=spf1 mx ptr -all',)),
+                         ('MX', (10, 'mx.blue.example.net'))],
+  'mx.blue.example.net': [('A', '192.0.2.10')],
+  '3.2.0.192.in-addr.arpa': [('PTR', 'ptr.blue.shared.example.net')],
+  'ptr.blue.shared.example.net': [('A', '192.0.2.3')],
+  'exp.shared.example.net': [('TXT', ('blue explanation',))],
+}
+GREEN_ZONE = {
+  'tenant.example.com': [('TXT', (TENANT_RECORD,))],
+  'inc.example.net': [('TXT', ('v=spf1 -all',))],
+  'shared.example.net': [('TXT', ('v=spf1 mx ptr -all',)),
+                         ('MX', (10, 'mx.green.example.net'))],
+  'mx.green.example.net': [('A', '198.51.100.10')],
+  '3.2.0.192.in-addr.arpa': [('PTR', 'ptr.green.shared.example.net')],
+  'ptr.green.shared.example.net': [('A', '198.51.100.3')],
+  'exp.shared.example.net': [('TXT', ('green explanation',))],
+}
+PATHS = ('tenant.example.com', 'inc.example.net', 'shared.example.net',
+  'mx.blue.example.net', '3.2.0.192.in-addr.arpa',
+  'ptr.blue.shared.example.net', 'exp.shared.example.net')
+GREEN_PATHS = ('tenant.example.com', 'inc.example.net', 'shared.example.net',
+  'mx.green.example.net', '3.2.0.192.in-addr.arpa',
+  'ptr.green.shared.example.net', 'exp.shared.example.net')
+
+
+def harnessZone(zone):
+  "Convert a FakeResolver zone to the zonedata format used by DNSLookup."
+  return dict((name, [(t, v, name) for t, v in rrs])
+              for name, rrs in zone.items())
+
+
+class ResolverIsolationTest(unittest.TestCase):
+
+  def outcome(self, resolver, spftext=None, ip='192.0.2.3'):
+    q = spf.query(i=ip, s='user@tenant.example.com',
+                  h='mx.tenant.example.com', resolver=resolver, querytime=0)
+    return q.check(spftext)
+
+  def testInterleavedViewsStayIsolated(self):
+    # Interleave two tenants that share domain names but authorize
+    # oppositely.  Every check must be stable and every lookup of one
+    # check must stay inside that tenant's view.
+    blue = FakeResolver(BLUE_ZONE)
+    green = FakeResolver(GREEN_ZONE)
+    for n in range(3):
+      bres = self.outcome(blue)
+      gres = self.outcome(green)
+      self.assertEqual(('pass', 250, spf.EXPLANATIONS['pass']), bres)
+      self.assertEqual(('fail', 550, spf.EXPLANATIONS['fail']), gres)
+    for resolver, zone in ((blue, BLUE_ZONE), (green, GREEN_ZONE)):
+      for key in resolver.queries:
+        self.assertIn(key[0], zone, key)
+    # The recursive check must really touch every mechanism and exp=.
+    qtypes = set(qtype for _, qtype in blue.queries)
+    self.assertTrue(set(['TXT', 'MX', 'PTR', 'A']) <= qtypes, qtypes)
+    for name in PATHS:
+      self.assertIn(name, set(n for n, _ in blue.queries), name)
+    for name in GREEN_PATHS:
+      self.assertIn(name, set(n for n, _ in green.queries), name)
+    self.assertIn(('exp.shared.example.net', 'TXT'), blue.queries)
+    self.assertIn(('exp.shared.example.net', 'TXT'), green.queries)
+
+  def testExplanationUsesCallerResolver(self):
+    record = 'v=spf1 -all exp=exp.shared.example.net'
+    blue = FakeResolver(BLUE_ZONE)
+    green = FakeResolver(GREEN_ZONE)
+    self.assertEqual(('fail', 550, 'blue explanation'),
+      self.outcome(blue, record))
+    self.assertEqual(('fail', 550, 'green explanation'),
+      self.outcome(green, record))
+
+  def testFailedLookupsAreNotTreatedAsNoRecords(self):
+    for zone in (BLUE_ZONE, GREEN_ZONE):
+      # Exception raised by the resolver call itself.
+      r = FakeResolver(zone)
+      r.raise_on[('tenant.example.com', 'TXT')] = RuntimeError('view offline')
+      self.assertEqual(('temperror', 451,
+        'SPF Temporary Error: DNS view offline'), self.outcome(r))
+      # Exception raised part way through answer iteration.
+      r = FakeResolver(zone)
+      r.raise_after[('tenant.example.com', 'TXT')] = \
+        RuntimeError('truncated reply')
+      self.assertEqual(('temperror', 451,
+        'SPF Temporary Error: DNS truncated reply'), self.outcome(r))
+      # An empty answer is a real answer: it must not become temperror.
+      empty = FakeResolver({})
+      self.assertEqual(('none', 250, ''), self.outcome(empty))
+
+  def testCacheAndBudgetArePerRequest(self):
+    blue = FakeResolver(BLUE_ZONE)
+    green = FakeResolver(GREEN_ZONE)
+    q1 = spf.query(i='192.0.2.3', s='user@tenant.example.com',
+                   h='mx.tenant.example.com', resolver=blue, querytime=20)
+    q2 = spf.query(i='192.0.2.3', s='user@tenant.example.com',
+                   h='mx.tenant.example.com', resolver=green, querytime=20)
+    self.assertIsNot(q1.cache, q2.cache)
+    self.assertEqual(20, q1.querytime)
+    self.assertEqual(('pass', 250, spf.EXPLANATIONS['pass']), q1.check())
+    blue_cache = dict(q1.cache)
+    self.assertEqual(('fail', 550, spf.EXPLANATIONS['fail']), q2.check())
+    # The second request did not see or alter the first tenant's answers.
+    self.assertEqual(blue_cache, q1.cache)
+    self.assertNotEqual(blue_cache, q2.cache)
+    # The two budgets were consumed independently, not shared.
+    self.assertGreater(q1.querytime, 19)
+    self.assertGreater(q2.querytime, 19)
+    # A request refused for its own exhausted budget does not affect
+    # an interleaved request that still has budget left.
+    exhausted = spf.query(i='192.0.2.3', s='user@tenant.example.com',
+                          h='mx.tenant.example.com', resolver=blue,
+                          querytime=20)
+    exhausted.querytime = -1
+    self.assertEqual(('temperror', 451,
+      'SPF Temporary Error: DNS Error: exceeded max query lookup time'),
+      exhausted.check())
+    self.assertGreater(q1.querytime, 19)
+    self.assertEqual(0, exhausted.lookups)
+    # Reusing one query object with a different resolver must start a new
+    # request rather than reuse the previous DNS view's answers.
+    blue_green = FakeResolver(GREEN_ZONE)
+    q1.resolver = blue_green
+    q1.querytime = -1
+    self.assertEqual(('fail', 550, spf.EXPLANATIONS['fail']), q1.check())
+    self.assertGreater(q1.querytime, 19)
+    self.assertIn(('shared.example.net', 'TXT'), blue_green.queries)
+
+  def testLegacyGlobalLookupStillWorks(self):
+    global zonedata
+    saved = zonedata
+    try:
+      zonedata = harnessZone(BLUE_ZONE)
+      q = spf.query(i='192.0.2.3', s='user@tenant.example.com',
+                    h='mx.tenant.example.com')
+      self.assertEqual(('pass', 250, spf.EXPLANATIONS['pass']), q.check())
+    finally:
+      zonedata = saved
+    self.assertEqual(('pass', spf.EXPLANATIONS['pass']),
+      spf.check2(i='192.0.2.3', s='user@tenant.example.com',
+                 h='mx.tenant.example.com', resolver=FakeResolver(BLUE_ZONE)))
+    self.assertEqual(('pass', 250, spf.EXPLANATIONS['pass']),
+      spf.check(i='192.0.2.3', s='user@tenant.example.com',
+                h='mx.tenant.example.com', resolver=FakeResolver(BLUE_ZONE)))
+    self.assertEqual(('fail', spf.EXPLANATIONS['fail']),
+      spf.check2(i='192.0.2.3', s='user@tenant.example.com',
+                 h='mx.tenant.example.com', resolver=FakeResolver(GREEN_ZONE)))
+
 def makeSuite(filename):
   suite = unittest.TestSuite()
   for t in loadYAML(filename).values():
@@ -226,6 +408,8 @@ def makeSuite(filename):
 
 def docsuite():
   suite = unittest.defaultTestLoader.loadTestsFromTestCase(SPFTestCases)
+  suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(
+    ResolverIsolationTest))
   try:
     import authres
   except:
