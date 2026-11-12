@@ -420,6 +420,11 @@ class query(object):
         self.default_modifier = True
         self.verbose = verbose
         self.authserv = None # Only used in A-R header generation tests
+        # Authorization provenance for the last check(): None before any
+        # check, 'domain' for a sender-published directive, 'local' for a
+        # receiver local-policy (libspf_local) exception.
+        self.result_source = None
+        self.mechanism_source = None
 
     def log(self,mech,d,spf):
         print('%s: %s "%s"'%(mech,d,spf))
@@ -596,15 +601,27 @@ class query(object):
         self.mechanism = None
         self.void_lookups = 0
         self.options = {}
+        # Source of an authorization: 'domain' (published SPF record) or
+        # 'local' (receiver-supplied libspf_local policy).  Always reflects
+        # the last check(), so callers can tell a domain-authorized pass
+        # apart from a local exception that only looks like a domain pass.
+        self.result_source = None
+        self.mechanism_source = None
+        # Token range (start, count) occupied by spliced local policy in the
+        # top-level record, excluding the leading 'v=spf1'. None when no
+        # local policy is spliced in for this check.
+        self._local_range = None
 
         try:
             self.lookups = 0
             if not spf:
                 spf = self.dns_spf(self.d)
                 if self.verbose: self.log("top",self.d,spf)
-            if self.libspf_local and spf: 
-                spf = insert_libspf_local_policy(
+            if self.libspf_local and spf:
+                spf, start, count = _insert_libspf_local_policy_indexed(
                     spf, self.libspf_local)
+                if start is not None:
+                    self._local_range = (start, count)
             rc = self.check1(spf, self.d, 0)
             if self.perm_error:
                 # lax processing encountered a permerror, but continued
@@ -871,13 +888,24 @@ class query(object):
         default = 'neutral'
         mechs = []
 
+        # Attribute directives by the exact slice spliced in from receiver
+        # local policy, so a local exception is never mistaken for a
+        # directive published by the sender domain.  Only the top-level
+        # record can contain spliced local policy.
+        local_idx = set()
+        if not recursion and self._local_range is not None:
+            start, count = self._local_range
+            local_idx = set(range(start, start + count))
+
         modifiers = []
         # Look for modifiers
         #
-        for mech in spf:
+        for idx, mech in enumerate(spf):
             m = RE_MODIFIER.split(mech)[1:]
             if len(m) != 2:
-                mechs.append(self.validate_mechanism(mech))
+                parsed = self.validate_mechanism(mech)
+                mechs.append(parsed + (
+                    'local' if idx in local_idx else 'domain',))
                 continue
 
             mod,arg = m
@@ -923,8 +951,8 @@ class query(object):
 
         # Evaluate mechanisms
         #
-        for mech, m, arg, cidrlength, result in mechs:
-
+        matched_source = None
+        for mech, m, arg, cidrlength, result, source in mechs:
             if m == 'include':
                 self.check_lookups()
                 d = self.dns_spf(arg)
@@ -996,9 +1024,16 @@ class query(object):
                 return self.check1(redirect_record, redirect, recursion)
             result = default
             mech = None
+            source = None
 
         if not recursion:       # record matching mechanism at base level
             self.mechanism = mech
+            # Attribute the deciding directive by its position in the spliced
+            # record: 'domain' (published record) or 'local' (receiver
+            # local policy).  This avoids presenting a local exception as if
+            # the sender domain had authorized the client.
+            self.mechanism_source = source
+            self.result_source = source
         if result == 'fail':
             return (result, 550, exps[result])
         else:
@@ -1573,7 +1608,20 @@ class query(object):
         else:
             return(self.parse_header_spf(val))
 
-    def get_header(self, res, receiver=None, header_type='spf', aid=None, **kv):
+    def authorization_source(self):
+        """Provenance of the deciding directive from the last check().
+
+        Returns 'domain' when the match comes from the sender domain's
+        published SPF record, 'local' when it comes from receiver-supplied
+        local policy (libspf_local), and None when no directive matched
+        (neutral/none/error) or check() has not run.  A 'pass' with source
+        'local' must not be represented as authorization granted by the
+        sender domain.
+        """
+        return self.result_source
+
+    def get_header(self, res, receiver=None, header_type='spf', aid=None,
+                   annotate_source=False, **kv):
         """
         Generate Received-SPF or Authentication Results header based on the
          last lookup.
@@ -1645,6 +1693,12 @@ class query(object):
         else:
             problem = None
         mechanism = quote_value(self.mechanism)
+        if annotate_source and getattr(self, 'result_source', None):
+            # Explicitly distinguish a receiver local-policy exception from
+            # a directive published by the sender domain.  The base result and
+            # wording are unchanged; the distinction is carried in an x- field
+            # (Received-SPF) so existing consumers keep parsing as before.
+            kv.setdefault('policy_source', self.result_source)
         if hasattr(self,'comment'):
           comment = self.comment
         else:
@@ -1899,6 +1953,45 @@ def split(str, delimiters, joiner=None):
     result.append(element)
     return result
 
+def _insert_libspf_local_policy_indexed(spftxt, local=None):
+    """Like insert_libspf_local_policy(), but also reports where the local
+    policy tokens landed in the resulting record.
+
+    Returns (new_spftxt, start, count) where start/count are the index range
+    in the token list (excluding the leading 'v=spf1') occupied by local
+    policy.  When local policy is not spliced in, returns (spftxt, None, 0).
+    The position is derived from the actual insertion, so it stays correct
+    even when a domain mechanism has text identical to a local one.
+    """
+    if not local:
+        return spftxt, None, 0
+    local_tokens = [t for t in local.split(' ') if t]
+    spf = spftxt.split()[1:]
+    if spf:
+        # local policy is SPF mechanisms/modifiers with no
+        # 'v=spf1' at the start.  Find the last mechanism carrying the
+        # default (pass) qualifier and insert immediately after it.  The
+        # reversed scan below is the historical algorithm; derive the
+        # forward insertion index in parallel.
+        reversed_spf = list(reversed(spf))
+        for rev_mech in reversed_spf:
+        # map '?' '+' or '-' to 'neutral' 'pass'
+        # or 'fail'
+            if not RESULTS.get(rev_mech[0]):
+                # actually finds last mech with default result
+                where = reversed_spf.index(rev_mech)
+                reversed_spf[where:where] = [local]
+                forward = [t for term in reversed(reversed_spf)
+                           for t in term.split(' ')]
+                # the matched default-qualifier mech sits at this index;
+                # local policy occupies the tokens right after it
+                matched_index = len(spf) - 1 - where
+                start = matched_index + 1
+                return ('v=spf1 ' + ' '.join(forward),
+                        start, len(local_tokens))
+        return spftxt, None, 0  # No local policy adds for v=spf1 -all
+    return 'v=spf1 ' + local, 0, len(local_tokens)
+
 def insert_libspf_local_policy(spftxt, local=None):
     """Returns spftxt with local inserted just before last non-fail
     mechanism.  This is how the libspf{2} libraries handle "local-policy".
@@ -1927,28 +2020,9 @@ def insert_libspf_local_policy(spftxt, local=None):
     # just after last non-fail mechanism.  This is how
     # libspf2 handles "local policy", and some people
     # apparently find it useful (don't ask me why).
-    if not local: return spftxt
-    spf = spftxt.split()[1:]
-    if spf:
-        # local policy is SPF mechanisms/modifiers with no
-        # 'v=spf1' at the start
-        spf.reverse() #find the last non-fail mechanism
-        for mech in spf:
-        # map '?' '+' or '-' to 'neutral' 'pass'
-        # or 'fail'
-            if not RESULTS.get(mech[0]):
-                # actually finds last mech with default result
-                where = spf.index(mech)
-                spf[where:where] = [local]
-                spf.reverse()
-                local = ' '.join(spf)
-                break
-        else:
-            return spftxt # No local policy adds for v=spf1 -all
-    # Processing limits not applied to local policy.  Suggest
-    # inserting 'local' mechanism to handle this properly
-    #MAX_LOOKUP = 100 
-    return 'v=spf1 '+local
+    new_spftxt, _start, _count = _insert_libspf_local_policy_indexed(
+        spftxt, local)
+    return new_spftxt
 
 if sys.version_info[0] == 2:
   def to_ascii(s):

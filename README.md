@@ -103,6 +103,36 @@ Note: SPF results alone are never sufficient to decide that a message should be
 accepted.  Accept, reject, or defer decisions are a function of local reciever
 policy.
 
+### Local policy and authorization provenance
+
+The `local=` parameter (also exposed as `--local` in spfquery.py) splices
+receiver-supplied mechanisms into the sender domain's published record,
+emulating libspf2 "local policy".  A match produced by those mechanisms is a
+receiver-side exception, not authorization granted by the sender domain, yet
+the raw SPF result is still `pass` and the default Received-SPF wording still
+says the domain "designates" the client.  Do not treat such a pass as
+domain-published authorization.
+
+After `check()`, the query object exposes the provenance of the deciding
+directive so the two cases can be distinguished without parsing the spliced
+string:
+
+* `q.authorization_source()` (or `q.result_source`) returns `'domain'` for a
+  directive from the sender's published record, `'local'` for a local-policy
+  directive, and `None` when no directive matched (neutral/none/error).
+* `q.mechanism_source` gives the same value scoped to `q.mechanism`.
+* `q.get_header(res, annotate_source=True)` adds an
+  `x-policy-source=local|domain;` field to a Received-SPF header.  The default
+  header is unchanged, so existing consumers keep working; callers that need
+  the distinction must opt in.
+
+Local policy is spliced exactly once, into the top-level record.  It is never
+re-inserted into `include:` or `redirect=` domains, and it does not apply when
+the sender domain publishes no SPF record.  Because the splice point depends on
+record layout (it is skipped for an all-explicit-fail record such as
+`v=spf1 -all`), provenance should always be read from the attributes above
+rather than inferred from the record text.
+
 The RFC 4408/7208 compliant API::
 
         >>> import spf

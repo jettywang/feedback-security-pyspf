@@ -218,6 +218,98 @@ class SPFTestCases(unittest.TestCase):
     res,code,txt = q.check('v=spf1...')
     self.assertEqual('ambiguous',res)
 
+  def testLocalPolicySpliceUnchanged(self):
+    # String splicing behavior must stay byte-identical (backward compat).
+    f = spf.insert_libspf_local_policy
+    self.assertEqual('v=spf1 -all', f('v=spf1 -all', 'mx'))
+    self.assertEqual('v=spf1 mx a ptr -all',
+        f('v=spf1 mx -all', 'a ptr'))
+    self.assertEqual(
+        'v=spf1 ip4:1.2.3.4 ip4:192.0.2.3 a:example.org -a:example.net -all',
+        f('v=spf1 ip4:1.2.3.4 -a:example.net -all',
+          'ip4:192.0.2.3 a:example.org'))
+    # indexed helper reports the exact slice occupied by local policy
+    out, start, count = spf._insert_libspf_local_policy_indexed(
+        'v=spf1 mx -all', 'a ptr')
+    self.assertEqual('v=spf1 mx a ptr -all', out)
+    self.assertEqual(['a', 'ptr'], out.split()[1:][start:start + count])
+    # nothing spliced for an all-fail record
+    out, start, count = spf._insert_libspf_local_policy_indexed(
+        'v=spf1 -all', 'mx')
+    self.assertEqual(('v=spf1 -all', None, 0), (out, start, count))
+
+  def testLocalPolicySourceProvenance(self):
+    # The client IP is authorized only by local policy, never by the record.
+    ip = '192.0.2.66'
+    q = spf.query(i=ip, s='u@strict.example.com', h='helo',
+                  local='ip4:%s' % ip, receiver='rcpt')
+    res, code, txt = q.check(spf='v=spf1 ip4:198.51.100.7 -all')
+    self.assertEqual('pass', res)
+    self.assertEqual('local', q.authorization_source())
+    self.assertEqual('local', q.mechanism_source)
+    hdr = q.get_header(res, annotate_source=True)
+    self.assertIn('x-policy-source=local;', hdr)
+    # default header must remain unchanged (no source field)
+    self.assertNotIn('x-policy-source', q.get_header(res))
+
+  def testDomainPolicySourceProvenance(self):
+    ip = '192.0.2.66'
+    q = spf.query(i=ip, s='u@dom.example.com', h='helo',
+                  local='ip4:198.51.100.9', receiver='rcpt')
+    res, code, txt = q.check(spf='v=spf1 ip4:%s -all' % ip)
+    self.assertEqual('pass', res)
+    self.assertEqual('domain', q.authorization_source())
+    self.assertEqual('domain', q.mechanism_source)
+    self.assertIn('x-policy-source=domain;',
+        q.get_header(res, annotate_source=True))
+
+  def testLocalPolicyIdenticalTextPosition(self):
+    # Same mechanism text in both record and local: position, not text,
+    # decides provenance, so the domain's own directive wins attribution.
+    ip = '192.0.2.66'
+    q = spf.query(i=ip, s='u@same.example.com', h='helo',
+                  local='ip4:%s' % ip, receiver='rcpt')
+    res, code, txt = q.check(spf='v=spf1 ip4:%s -all' % ip)
+    self.assertEqual('pass', res)
+    self.assertEqual('domain', q.authorization_source())
+
+  def testLocalPolicyQualifierProvenance(self):
+    ip = '192.0.2.66'
+    q = spf.query(i=ip, s='u@dom.example.com', h='helo',
+                  local='~ip4:%s' % ip, receiver='rcpt')
+    res, code, txt = q.check(spf='v=spf1 ip4:198.51.100.7 -all')
+    self.assertEqual('softfail', res)
+    self.assertEqual('local', q.authorization_source())
+
+  def testLocalPolicyNotInsertedInRecursion(self):
+    # Local policy is spliced once, at the top record; included domains are
+    # evaluated verbatim and must not carry the receiver's policy.
+    global zonedata
+    save = zonedata
+    zonedata = {
+      'top.example.com': [
+        ('TXT', ('v=spf1 include:sub.example.com -all',), 'top.example.com')],
+      'sub.example.com': [
+        ('TXT', ('v=spf1 ip4:198.51.100.7 -all',), 'sub.example.com')],
+    }
+    seen = []
+    orig = spf._insert_libspf_local_policy_indexed
+    def spy(spftxt, local=None):
+      seen.append(spftxt)
+      return orig(spftxt, local)
+    spf._insert_libspf_local_policy_indexed = spy
+    try:
+      q = spf.query(i='192.0.2.66', s='u@top.example.com', h='helo',
+                    local='ip4:192.0.2.66', receiver='rcpt')
+      res, code, txt = q.check()
+    finally:
+      spf._insert_libspf_local_policy_indexed = orig
+      zonedata = save
+    self.assertEqual('pass', res)
+    self.assertEqual(1, len(seen))
+    self.assertEqual('v=spf1 include:sub.example.com -all', seen[0])
+    self.assertEqual('local', q.authorization_source())
+
 def makeSuite(filename):
   suite = unittest.TestSuite()
   for t in loadYAML(filename).values():
