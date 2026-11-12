@@ -427,11 +427,14 @@ class query(object):
     def set_ip(self, i):
         "Set connect ip, and ip6 or ip4 mode."
         self.iplist = False
+        self.p = None   # discard lazy PTR result cached for previous ip
         if i.lower() == 'list':
             self.iplist = []
+            self.ipaddr = self.c = self.i = None
             ip6 = False
         elif i.lower() == 'list6':
             self.iplist = []
+            self.ipaddr = self.c = self.i = None
             ip6 = True
         else:
             try:
@@ -596,6 +599,9 @@ class query(object):
         self.mechanism = None
         self.void_lookups = 0
         self.options = {}
+        # discard explanations expanded from a previous check (e.g. exp=
+        # macros may embed the previous connect ip)
+        self.exps = dict(self.defexps)
 
         try:
             self.lookups = 0
