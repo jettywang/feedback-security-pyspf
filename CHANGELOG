@@ -1,3 +1,9 @@
+Version 2.1.1
+  * Add optional structured evaluation traces (trace=True on check2/query).
+    Traces record the records, mechanisms, includes, redirects and errors
+    actually evaluated, preserve short-circuit evaluation, and omit sender
+    identity unless trace_sender=True.
+
 Version 2.1.0
   * Switch to setuptools because "it's the future"
   * Require ipaddress instead of ipaddr for python2

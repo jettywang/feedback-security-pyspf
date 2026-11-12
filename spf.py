@@ -304,7 +304,275 @@ class PermError(Exception):
             return '%s: %s'%(self.msg, self.mech)
         return self.msg
 
-def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME, verbose=False, querytime=20):
+class EvaluationTrace(object):
+    """Structured, opt-in record of an SPF evaluation.
+
+    Create one with ``query(..., trace=True)`` and inspect it as
+    ``query.trace`` after calling ``check()``.  A caller supplied
+    ``EvaluationTrace`` instance may also be passed as ``trace=`` to
+    ``query`` or ``check2``; it is reset at the start of each check.
+
+    ``entries`` is an ordered list of JSON-friendly dictionaries describing
+    the records, mechanisms, include transformations, redirect delegations,
+    decisions and errors that were actually reached.  ``queries`` lists only
+    the DNS lookups that were actually attempted (including cache hits, which
+    are marked as such); it never contains domains that were skipped.
+
+    Raw sender details (the full MAIL FROM address, its local part and the
+    HELO name) are not collected unless ``include_sender=True`` is passed.
+    Macro expansions in the trace are redacted when this is off.
+    """
+
+    METADATA = ('entries', 'queries', 'result', 'code', 'explanation',
+                'sender_domain', 'sender', 'local_part', 'helo', 'ident')
+
+    def __init__(self, include_sender=False):
+        self.include_sender = bool(include_sender)
+        self.reset()
+
+    def reset(self):
+        self.entries = []
+        self.queries = []
+        self.result = None
+        self.code = None
+        self.explanation = None
+        self.sender_domain = None
+        self.sender = None
+        self.local_part = None
+        self.helo = None
+        self.ident = None
+        self._next_id = 0
+        self._frames = []
+        self._error_objects = {}
+        self._current_mechanism = None
+        self._terminal_error = None
+
+    def _add(self, type, parent=None, **fields):
+        entry = {'id': self._next_id, 'type': type}
+        self._next_id += 1
+        if parent is not None:
+            entry['parent'] = parent
+        entry.update(fields)
+        self.entries.append(entry)
+        return entry
+
+    # -- record frames -------------------------------------------------
+    def frame_enter(self, domain, recursion, via='top', parent=None,
+                    mechanism=None, record=None):
+        entry = self._add('record', parent=parent, domain=domain,
+                          recursion=recursion, depth=len(self._frames),
+                          via=via)
+        if mechanism is not None:
+            entry['mechanism'] = mechanism
+        if record is not None:
+            entry['record'] = record
+        self._frames.append(entry)
+        return entry
+
+    def frame_exit(self, frame, result, code, explanation, reason=None):
+        frame['result'] = result
+        frame['code'] = code
+        frame['explanation'] = explanation
+        if reason is not None:
+            frame['reason'] = reason
+        if self._frames and self._frames[-1] is frame:
+            self._frames.pop()
+
+    @property
+    def frame(self):
+        return self._frames[-1] if self._frames else None
+
+    @property
+    def current_mechanism(self):
+        return self._current_mechanism
+
+    @current_mechanism.setter
+    def current_mechanism(self, entry):
+        self._current_mechanism = entry
+
+    def frame_path(self):
+        return [{'id': f['id'], 'domain': f.get('domain'),
+                 'via': f.get('via')} for f in self._frames]
+
+    def path_to(self, frame):
+        """Rebuild the record path down to ``frame`` from parent links."""
+        lookup = dict((e['id'], e) for e in self.entries
+                      if e.get('type') == 'record')
+        stack = []
+        current = frame
+        seen = set()
+        while current is not None and current.get('id') not in seen:
+            seen.add(current.get('id'))
+            stack.append({'id': current.get('id'),
+                          'domain': current.get('domain'),
+                          'via': current.get('via')})
+            current = lookup.get(current.get('parent'))
+        stack.reverse()
+        return stack
+
+    # -- mechanisms and modifiers -------------------------------------
+    def add_mechanism(self, frame, source, stage='parsing'):
+        entry = self._add('mechanism', parent=frame['id'] if frame else None,
+                          source=source, stage=stage)
+        if frame:
+            entry['domain'] = frame.get('domain')
+        self._current_mechanism = entry
+        return entry
+
+    def add_modifier(self, frame, modifier, source, stage='parsed', **fields):
+        entry = self._add('modifier', parent=frame['id'] if frame else None,
+                          modifier=modifier, source=source, stage=stage,
+                          **fields)
+        if frame and 'domain' not in fields:
+            entry['domain'] = frame.get('domain')
+        return entry
+
+    def note_lookup(self, count):
+        if self._current_mechanism is not None:
+            self._current_mechanism['lookup_count'] = count
+
+    def note_query(self, name, qtype, cached, answers=None, void=None,
+                   **fields):
+        query = {'name': name, 'qtype': qtype, 'cached': bool(cached)}
+        if answers is not None:
+            query['answers'] = answers
+        if void is not None:
+            query['void'] = void
+        for key, value in fields.items():
+            if value is not None:
+                query[key] = value
+        self.queries.append(query)
+        return query
+
+    # -- conclusions and errors ---------------------------------------
+    def decision(self, frame, result, code, explanation, reason,
+                 mechanism=None):
+        entry = self._add('decision', parent=frame['id'] if frame else None,
+                          domain=frame.get('domain') if frame else None,
+                          result=result, code=code, explanation=explanation,
+                          reason=reason)
+        if mechanism is not None:
+            entry['mechanism'] = mechanism
+        if frame is not None:
+            frame['reason'] = reason
+        return entry
+
+    def add_error(self, error, phase, frame=None, domain=None, query=None,
+                  mechanism=None, fatal=True, frame_path=None, **fields):
+        frame = frame if frame is not None else self.frame
+        mech = mechanism
+        if mech is None and self._current_mechanism is not None:
+            mech = self._current_mechanism.get('source')
+        entry = self._add('error', parent=frame['id'] if frame else None,
+                          phase=phase, error=type(error).__name__,
+                          message=str(error), fatal=bool(fatal))
+        if domain is not None:
+            entry['domain'] = domain
+        elif frame is not None:
+            entry['domain'] = frame.get('domain')
+        if mech is not None:
+            entry['mechanism'] = mech
+        if self._current_mechanism is not None:
+            entry['mechanism_id'] = self._current_mechanism.get('id')
+            self._current_mechanism['stage'] = 'error'
+            self._current_mechanism['error'] = str(error)
+        if query is not None:
+            entry['query'] = dict(query)
+        entry['frame_path'] = frame_path if frame_path is not None \
+            else self.frame_path()
+        entry.update(fields)
+        self._error_objects[id(error)] = entry['id']
+        return entry
+
+    def finish(self, result, code, explanation, mechanism=None):
+        self.result = result
+        self.code = code
+        self.explanation = explanation
+        entry = self._add('result', result=result, code=code,
+                          explanation=explanation)
+        if mechanism is not None:
+            entry['mechanism'] = mechanism
+        source = self.error_record(self._terminal_error) \
+            if self._terminal_error is not None else None
+        if source is not None:
+            entry['error_source'] = {
+                'id': source['id'],
+                'domain': source.get('domain'),
+                'message': source.get('message'),
+                'frame_path': source.get('frame_path'),
+                'mechanism': source.get('mechanism'),
+            }
+        return entry
+
+    def mark_terminal_error(self, error, phase, domain=None):
+        """Mark the originating error as fatal for the final result.
+
+        Exceptions propagate outward unchanged, so the record created when
+        the exception was first seen belongs to the innermost frame (or the
+        DNS layer) that raised it.  Marking it there keeps the trace
+        attribution on the actual origin instead of the top level record
+        that merely observed the exception.
+        """
+        self._terminal_error = error
+        entry = self.error_record(error)
+        if entry is not None:
+            entry['fatal'] = True
+            return entry
+        return self.add_error(error, phase=phase, domain=domain, fatal=True)
+
+    def has_error(self, error):
+        return id(error) in self._error_objects
+
+    def error_record(self, error):
+        entry_id = self._error_objects.get(id(error))
+        if entry_id is None:
+            return None
+        for entry in self.entries:
+            if entry.get('id') == entry_id:
+                return entry
+        return None
+
+    # -- convenient structured access --------------------------------
+    def to_dict(self):
+        import copy
+        return copy.deepcopy({
+            'result': self.result,
+            'code': self.code,
+            'explanation': self.explanation,
+            'sender_domain': self.sender_domain,
+            'sender': self.sender,
+            'local_part': self.local_part,
+            'helo': self.helo,
+            'ident': self.ident,
+            'entries': self.entries,
+            'queries': self.queries,
+        })
+
+    def to_json(self, **kwargs):
+        import json
+        kwargs.setdefault('sort_keys', True)
+        return json.dumps(self.to_dict(), **kwargs)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self.entries[key]
+        if key in self.METADATA:
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(self.entries)
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __repr__(self):
+        return '<EvaluationTrace %s: %d entries, %d queries>' % (
+            self.result, len(self.entries), len(self.queries))
+
+
+def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME,
+           verbose=False, querytime=20, trace=False, trace_sender=False):
     """Test an incoming MAIL FROM:<s>, from a client with ip address i.
     h is the HELO/EHLO domain name.  This is the RFC4408/7208 compliant
     pySPF2.0 interface.  The interface returns an SPF result and explanation
@@ -321,12 +589,21 @@ def check2(i, s, h, local=None, receiver=None, timeout=MAX_PER_LOOKUP_TIME, verb
     Returns (result, explanation) where result in
     ['pass', 'permerror', 'fail', 'temperror', 'softfail', 'none', 'neutral' ].
 
+    If trace is true, the structured EvaluationTrace is returned as a third
+    element: (result, explanation, trace).  trace_sender controls whether
+    sender identifying details are copied into the trace; they are omitted
+    by default.
+
     Example:
     #>>> check2(i='61.51.192.42', s='liukebing@bcc.com', h='bmsi.com')
 
     """
-    res,_,exp = query(i=i, s=s, h=h, local=local,
-        receiver=receiver,timeout=timeout,verbose=verbose,querytime=querytime).check()
+    q = query(i=i, s=s, h=h, local=local, receiver=receiver,timeout=timeout,
+              verbose=verbose,querytime=querytime,trace=trace,
+              trace_sender=trace_sender)
+    res,_,exp = q.check()
+    if trace:
+        return res, exp, q.trace
     return res,exp
 
 def check(i, s, h, local=None, receiver=None, verbose=False):
@@ -373,7 +650,8 @@ class query(object):
     Also keeps cache: DNS cache.  
     """
     def __init__(self, i, s, h, local=None, receiver=None, strict=True,
-                timeout=MAX_PER_LOOKUP_TIME,verbose=False,querytime=0):
+                timeout=MAX_PER_LOOKUP_TIME,verbose=False,querytime=0,
+                trace=False, trace_sender=False):
         self.s, self.h = s, h
         if not s and h:
             self.s = 'postmaster@' + h
@@ -416,10 +694,62 @@ class query(object):
         # For IPv4, self.i = self.c, but not in IPv6
         # self.iplist = list of IPv4/6 addresses that would pass, collected
         #               when list or list6 is passed as 'i'
-        # self.addr = ipaddr/ipaddress object representing the connect IP 
+        # self.addr = ipaddr/ipaddress object representing the connect IP
         self.default_modifier = True
         self.verbose = verbose
         self.authserv = None # Only used in A-R header generation tests
+        # Optional structured evaluation trace.  When it is not enabled,
+        # self.trace stays None and the evaluator takes no trace code paths.
+        if isinstance(trace, EvaluationTrace):
+            if trace_sender:
+                trace.include_sender = True
+            self.trace = trace
+        elif trace:
+            self.trace = EvaluationTrace(include_sender=trace_sender)
+        else:
+            self.trace = None
+
+    def _trace_safe(self, value):
+        """Return a trace-safe value, redacting sender secrets by default."""
+        if value is None or self.trace is None or self.trace.include_sender:
+            return value
+        if isinstance(value, (list, tuple)):
+            safe = [self._trace_safe(v) for v in value]
+            return tuple(safe) if isinstance(value, tuple) else safe
+        text = str(value)
+        changed = False
+        for secret in (self.l, self.s):
+            if secret and secret != 'postmaster' and len(secret) > 1:
+                if secret in text:
+                    text = text.replace(secret, '<redacted>')
+                    changed = True
+        return text if changed else value
+
+    def _trace_enter(self, domain, recursion, via='top', mechanism=None,
+                     record=None):
+        if self.trace is None:
+            return None
+        parent = self.trace.frame['id'] if self.trace.frame else None
+        return self.trace.frame_enter(
+            self._trace_safe(domain), recursion, via=via, parent=parent,
+            mechanism=mechanism, record=record)
+
+    def _trace_mechanism(self, frame, source):
+        if self.trace is None or frame is None:
+            return None
+        entry = self.trace.add_mechanism(frame, self._trace_safe(source),
+                                         stage='parsed')
+        self.trace.current_mechanism = entry
+        return entry
+
+    def _trace_error(self, error, phase, domain=None, query=None,
+                     mechanism=None, fatal=False, **fields):
+        if self.trace is None:
+            return
+        self.trace.add_error(error, phase=phase,
+                             domain=self._trace_safe(domain),
+                             query=query, mechanism=mechanism,
+                             fatal=fatal, **fields)
 
     def log(self,mech,d,spf):
         print('%s: %s "%s"'%(mech,d,spf))
@@ -597,12 +927,21 @@ class query(object):
         self.void_lookups = 0
         self.options = {}
 
+        if self.trace is not None:
+            self.trace.reset()
+            if self.trace.include_sender:
+                self.trace.sender = self.s
+                self.trace.local_part = self.l
+                self.trace.helo = self.h
+            self.trace.sender_domain = self._trace_safe(self.d)
+            self.trace.ident = self.ident
+
         try:
             self.lookups = 0
             if not spf:
                 spf = self.dns_spf(self.d)
                 if self.verbose: self.log("top",self.d,spf)
-            if self.libspf_local and spf: 
+            if self.libspf_local and spf:
                 spf = insert_libspf_local_policy(
                     spf, self.libspf_local)
             rc = self.check1(spf, self.d, 0)
@@ -610,12 +949,19 @@ class query(object):
                 # lax processing encountered a permerror, but continued
                 self.perm_error.ext = rc
                 raise self.perm_error
+            if self.trace is not None:
+                self.trace.finish(*rc, mechanism=self.mechanism)
             return rc
-                
+
         except TempError as x:
             self.prob = x.msg
             if x.mech:
                 self.mech.append(x.mech)
+            if self.trace is not None:
+                self.trace.mark_terminal_error(x, 'temporary')
+                self.trace.finish('temperror', 451,
+                                  'SPF Temporary Error: ' + str(x),
+                                  mechanism=self.mechanism)
             return ('temperror', 451, 'SPF Temporary Error: ' + str(x))
         except PermError as x:
             if not self.perm_error:
@@ -625,9 +971,14 @@ class query(object):
                 self.mech.append(x.mech)
             # Pre-Lentczner draft treats this as an unknown result
             # and equivalent to no SPF record.
+            if self.trace is not None:
+                self.trace.mark_terminal_error(x, 'permanent')
+                self.trace.finish('permerror', 550,
+                                  'SPF Permanent Error: ' + str(x),
+                                  mechanism=self.mechanism)
             return ('permerror', 550, 'SPF Permanent Error: ' + str(x))
 
-    def check1(self, spf, domain, recursion):
+    def check1(self, spf, domain, recursion, via='top', mechanism=None):
         # spf rfc: 3.7 Processing Limits
         #
         if recursion > MAX_RECURSION:
@@ -641,21 +992,56 @@ class query(object):
             # As an extended result, however, it should be
             # a PermError.
             raise PermError('Too many levels of recursion')
+        frame = self._trace_enter(domain, recursion, via=via,
+                                  mechanism=mechanism) \
+            if self.trace is not None else None
         try:
             try:
                 tmp, self.d = self.d, domain
-                return self.check0(spf, recursion)
+                rc = self.check0(spf, recursion)
             finally:
                 self.d = tmp
+            if frame is not None:
+                self.trace.frame_exit(frame, *rc)
+            return rc
         except AmbiguityWarning as x:
             self.prob = x.msg
             if x.mech:
                 self.mech.append(x.mech)
-            return ('ambiguous', 000, 'SPF Ambiguity Warning: %s' % x)
+            rc = ('ambiguous', 000, 'SPF Ambiguity Warning: %s' % x)
+            if frame is not None:
+                self.trace.frame_exit(frame, *rc)
+            return rc
+        except (TempError, PermError) as x:
+            if frame is not None:
+                if not self.trace.has_error(x):
+                    phase = 'temporary' if isinstance(x, TempError) \
+                        else 'permanent'
+                    self._trace_error(x, phase, fatal=False, frame=frame,
+                                      frame_path=self.trace.path_to(frame))
+                rec = self.trace.error_record(x)
+                if rec is not None and 'origin_frame' not in rec:
+                    # First (innermost) frame to observe the exception owns
+                    # the attribution; outer frames must not overwrite it.
+                    rec['origin_frame'] = frame.get('id')
+                    rec['parent'] = frame.get('id')
+                    rec['frame_path'] = self.trace.path_to(frame)
+                frame['result'] = 'error'
+                frame['error'] = str(x)
+                frame['error_id'] = rec['id'] if rec is not None else None
+                if self.trace.frame is frame:
+                    self.trace._frames.pop()
+            raise
 
     def note_error(self, *msg):
         if self.strict:
-            raise PermError(*msg)
+            x = PermError(*msg)
+            if self.trace is not None and not self.trace.has_error(x):
+                frame_path = self.trace.path_to(self.trace.frame) \
+                    if self.trace.frame else []
+                self._trace_error(x, 'permanent', fatal=False,
+                                  frame_path=frame_path)
+            raise x
         # if lax mode, note error and continue
         if not self.perm_error:
             try:
@@ -663,6 +1049,8 @@ class query(object):
             except PermError as x:
                 # FIXME: keep a list of errors for even friendlier diagnostics.
                 self.perm_error = x
+                if self.trace is not None and not self.trace.has_error(x):
+                    self._trace_error(x, 'permanent', fatal=False)
         return self.perm_error
 
     def expand_domain(self,arg):
@@ -839,13 +1227,18 @@ class query(object):
         Returns (result, mta-status-code, explanation) where
         result in ['fail', 'unknown', 'pass', 'none']
         """
+        frame = self.trace.frame if self.trace is not None else None
+        reason = None
+        tracing = self.trace is not None
 
         if not spf:
+            if tracing:
+                self._trace_finish_frame(frame, 'none', 'no SPF record')
             return ('none', 250, EXPLANATIONS['none'])
 
         # Split string by space, drop the 'v=spf1'.  Split by all whitespace
         # casuses things like carriage returns being treated as valid space
-        # separators, so split() is not sufficient.  
+        # separators, so split() is not sufficient.
         spf = spf.split(' ')
         # Catch case where SPF record has no spaces.
         # Can never happen with conforming dns_spf(), however
@@ -855,21 +1248,29 @@ class query(object):
         if spf[0].lower() != 'v=spf1':
             if self.strict > 1:
                 raise AmbiguityWarning('Invalid SPF record in', self.d)
+            if tracing:
+                self._trace_finish_frame(frame, 'none', 'invalid SPF record')
             return ('none', 250, EXPLANATIONS['none'])
         # Just to make it even more fun, the relevant piece of the ABNF for
         # term separations is *( 1*SP ( directive / modifier ) ), so it's one
         # or more spaces, not just one.  So strip empty mechanisms.
         spf = [mech for mech in spf[1:] if mech]
+        if tracing:
+            frame['record'] = self._trace_safe(spf)
+            frame['terms'] = len(spf)
 
         # copy of explanations to be modified by exp=
         exps = self.exps
         redirect = None
+        redirect_entry = None
 
         # no mechanisms at all cause unknown result, unless
         # overridden with 'default=' modifier
         #
         default = 'neutral'
         mechs = []
+        # Parallel list of trace entries for evaluated directives.
+        traced = [] if tracing else None
 
         modifiers = []
         # Look for modifiers
@@ -877,7 +1278,10 @@ class query(object):
         for mech in spf:
             m = RE_MODIFIER.split(mech)[1:]
             if len(m) != 2:
+                entry = self._trace_mechanism(frame, mech) if tracing else None
                 mechs.append(self.validate_mechanism(mech))
+                if tracing:
+                    traced.append(entry)
                 continue
 
             mod,arg = m
@@ -892,6 +1296,8 @@ class query(object):
                 if not arg:
                     raise PermError('exp has empty domain-spec:',arg)
                 arg = self.expand_domain(arg)
+                if tracing:
+                    self._trace_modifier(frame, mech, 'exp', domain=arg)
                 if arg:
                     try:
                         exp = self.get_explanation(arg)
@@ -904,6 +1310,10 @@ class query(object):
                 redirect = self.expand_domain(arg)
                 if not redirect:
                     raise PermError('redirect has empty domain:',arg)
+                if tracing:
+                    redirect_entry = self._trace_modifier(
+                        frame, mech, 'redirect',
+                        domain=self._trace_safe(redirect))
             elif mod == 'default':
                 # default modifier is obsolete
                 if self.strict > 1:
@@ -913,38 +1323,69 @@ class query(object):
                     arg = self.expand(arg)
                     # default=- is the same as default=fail
                     default = RESULTS.get(arg, default)
+                if tracing:
+                    self._trace_modifier(frame, mech, 'default',
+                                         value=self._trace_safe(default))
             elif mod == 'op':
                 if not recursion:
                     for v in arg.split('.'):
                         if v: self.options[v] = True
+                if tracing:
+                    self._trace_modifier(frame, mech, 'op')
             else:
                 # spf rfc: 3.6 Unrecognized Mechanisms and Modifiers
                 self.expand(m[1])       # syntax error on invalid macro
+                if tracing:
+                    self._trace_modifier(frame, mech, mod, ignored=True)
+
+        if tracing:
+            frame['mechanisms'] = len(mechs)
+            frame['redirect'] = self._trace_safe(redirect)
 
         # Evaluate mechanisms
         #
-        for mech, m, arg, cidrlength, result in mechs:
+        matched = False
+        trace = self.trace
+        for index, (mech, m, arg, cidrlength, result) in enumerate(mechs):
+            if tracing:
+                entry = traced[index] if index < len(traced) else None
+                if entry is not None:
+                    entry['mechanism_type'] = m
+                    entry['qualifier'] = result
+                    entry['effective_domain'] = self._trace_safe(arg)
+                    if entry.get('stage') == 'parsed':
+                        entry['stage'] = 'evaluating'
+                    trace.current_mechanism = entry
+                matched = self._trace_evaluate_directive(
+                    frame, entry, mech, m, arg, cidrlength, result, recursion)
+                if matched:
+                    self._trace_skip_rest(traced, index + 1,
+                                          'a prior mechanism matched')
+                    break
+                continue
 
             if m == 'include':
                 self.check_lookups()
                 d = self.dns_spf(arg)
                 if self.verbose: self.log("include",arg,d)
-                res, code, txt = self.check1(d,arg, recursion + 1)
+                res, code, txt = self.check1(d, arg, recursion + 1)
                 if res == 'pass':
+                    matched = True
                     break
                 if res == 'none':
                     self.note_error(
                         'No valid SPF record for included domain: %s' %arg,
                       mech)
-                res = 'neutral'
                 continue
             elif m == 'all':
+                matched = True
                 break
 
             elif m == 'exists':
                 self.check_lookups()
                 try:
                     if len(self.dns_a(arg,'A')) > 0:
+                        matched = True
                         break
                 except AmbiguityWarning:
                     # Exists wants no response sometimes so don't raise
@@ -954,58 +1395,290 @@ class query(object):
             elif m == 'a':
                 self.check_lookups()
                 if self.cidrmatch(self.dns_a(arg,self.A), cidrlength):
+                    matched = True
                     break
 
             elif m == 'mx':
                 self.check_lookups()
                 if self.cidrmatch(self.dns_mx(arg), cidrlength):
+                    matched = True
                     break
 
             elif m == 'ip4':
                 if self.v == 'in-addr': # match own connection type only
                     try:
-                        if self.cidrmatch([arg], cidrlength): break
+                        if self.cidrmatch([arg], cidrlength):
+                            matched = True
+                            break
                     except socket.error:
                         raise PermError('syntax error', mech)
 
             elif m == 'ip6':
                 if self.v == 'ip6': # match own connection type only
                     try:
-                        if self.cidrmatch([arg], cidrlength): break
+                        if self.cidrmatch([arg], cidrlength):
+                            matched = True
+                            break
                     except socket.error:
                         raise PermError('syntax error', mech)
 
             elif m == 'ptr':
                 self.check_lookups()
                 if domainmatch(self.validated_ptrs(), arg):
+                    matched = True
                     break
 
         else:
             # no matches
             if redirect:
                 #Catch redirect to a non-existant SPF record.
+                if tracing:
+                    entry = self._trace_redirect(frame, redirect_entry,
+                                                 redirect)
                 redirect_record = self.dns_spf(redirect)
                 if not redirect_record:
-                    raise PermError('redirect domain has no SPF record',
-                        redirect)
+                    if tracing and entry is not None:
+                        entry['stage'] = 'error'
+                        entry['reason'] = 'redirect domain has no SPF record'
+                    err = PermError('redirect domain has no SPF record',
+                                    redirect)
+                    if tracing:
+                        self._trace_error(err, 'permanent', domain=redirect,
+                                          fatal=False)
+                    raise err
                 if self.verbose: self.log("redirect",redirect,redirect_record)
+                if tracing:
+                    if entry is not None:
+                        entry['stage'] = 'delegated'
+                        entry['record'] = self._trace_safe(
+                            redirect_record.split(' ', 1)[-1]
+                            if redirect_record else None)
+                        entry['reason'] = ('no mechanism matched; whole record'
+                                           ' delegated via redirect')
+                    trace.current_mechanism = None
                 # forget modifiers on redirect
                 if not recursion:
                   self.exps = dict(self.defexps)
                   self.options = {}
-                return self.check1(redirect_record, redirect, recursion)
+                rc = self.check1(redirect_record, redirect, recursion,
+                                 via='redirect', mechanism=mech)
+                if tracing and entry is not None:
+                    entry['redirect_result'] = rc[0]
+                    frame['reason'] = ('redirect delegation to %s'
+                                       % self._trace_safe(redirect))
+                    frame['delegated_to'] = self._trace_safe(redirect)
+                return rc
             result = default
             mech = None
+            reason = 'no mechanism matched; default result'
 
+        if matched and tracing:
+            reason = 'matched %s' % self._trace_safe(mech)
+            frame['matched_mechanism'] = self._trace_safe(mech)
         if not recursion:       # record matching mechanism at base level
             self.mechanism = mech
+        if tracing:
+            self._trace_finish_frame(frame, result, reason, mechanism=mech)
         if result == 'fail':
             return (result, 550, exps[result])
         else:
             return (result, 250, exps[result])
 
+    def _trace_skip_rest(self, traced, start, reason):
+        """Mark directives after the short-circuit point as not evaluated."""
+        if self.trace is None:
+            return
+        parent = self.trace.frame['id'] if self.trace.frame else None
+        for entry in traced[start:]:
+            if entry is None or entry.get('parent') != parent:
+                continue
+            if entry.get('stage') != 'parsed':
+                continue
+            entry['stage'] = 'skipped'
+            entry['skipped'] = True
+            entry['reason'] = reason
+
+    def _trace_finish_frame(self, frame, result, reason=None, mechanism=None):
+        if self.trace is None or frame is None:
+            return
+        frame['reason'] = reason
+        entry = self.trace.decision(frame, result, 550 if result == 'fail'
+                                     else 250, None, reason,
+                                     mechanism=mechanism)
+        entry['stage'] = 'record-result'
+
+    def _trace_modifier(self, frame, source, modifier, **fields):
+        if self.trace is None or frame is None:
+            return None
+        return self.trace.add_modifier(frame, modifier,
+                                       self._trace_safe(source),
+                                       stage='parsed', **fields)
+
+    def _trace_redirect(self, frame, redirect_entry, redirect):
+        if self.trace is None or frame is None:
+            return None
+        if redirect_entry is not None:
+            redirect_entry['stage'] = 'evaluating'
+            redirect_entry['delegation'] = True
+            redirect_entry['mechanism_type'] = 'redirect'
+            self.trace.current_mechanism = None
+            return redirect_entry
+        entry = self.trace.add_modifier(
+            frame, 'redirect', 'redirect=', stage='evaluating',
+            domain=self._trace_safe(redirect), delegation=True)
+        return entry
+
+    def _trace_evaluate_directive(self, frame, entry, mech, m, arg,
+                                  cidrlength, result, recursion):
+        """Evaluate one directive for a traced query.
+
+        Returns True when the mechanism matched and evaluation of this
+        record should stop.  Only called when ``self.trace`` is set; the
+        untraced path lives inline in check0 so disabling traces does not
+        add a call per directive.
+        """
+        if m == 'include':
+            self.check_lookups()
+            if entry is not None:
+                entry['stage'] = 'evaluating'
+                entry['mechanism_type'] = 'include'
+                entry['effective_domain'] = self._trace_safe(arg)
+                self.trace.current_mechanism = entry
+                self.trace.note_lookup(self.lookups)
+            d = self.dns_spf(arg)
+            if self.verbose: self.log("include",arg,d)
+            if entry is not None:
+                entry['transform'] = 'include'
+                entry['record_found'] = bool(d)
+            res, code, txt = self.check1(d, arg, recursion + 1,
+                                         via='include', mechanism=mech)
+            if entry is not None:
+                entry['included_result'] = res
+                entry['normalized_result'] = \
+                    'pass' if res == 'pass' else 'neutral'
+            if res == 'pass':
+                if entry is not None:
+                    entry['matched'] = True
+                    entry['stage'] = 'matched'
+                    entry['reason'] = ('include record returned pass'
+                                       '; inherited by including record')
+                    entry['decision'] = 'include matched; stop this record'
+                return True
+            if res == 'none':
+                self.note_error(
+                    'No valid SPF record for included domain: %s' %arg,
+                  mech)
+            if entry is not None:
+                entry['matched'] = False
+                entry['stage'] = 'no_match'
+                entry['reason'] = ('include record returned %s; treated as'
+                                    ' neutral, continue' % res)
+            return False
+        elif m == 'all':
+            if entry is not None:
+                entry['stage'] = 'matched'
+                entry['matched'] = True
+                entry['mechanism_type'] = 'all'
+                entry['reason'] = 'all mechanism reached; policy concluded'
+                entry['decision'] = 'all matched; stop this record'
+            return True
+
+        elif m == 'exists':
+            self.check_lookups()
+            if entry is not None:
+                self.trace.note_lookup(self.lookups)
+            try:
+                found = len(self.dns_a(arg,'A')) > 0
+            except AmbiguityWarning:
+                # Exists wants no response sometimes so don't raise
+                # the warning.
+                found = False
+                if entry is not None:
+                    entry['ambiguity'] = 'no A response treated as no match'
+            if entry is not None:
+                entry['matched'] = bool(found)
+                entry['stage'] = 'matched' if found else 'no_match'
+                entry['reason'] = ('exists lookup found data' if found
+                                   else 'exists lookup returned no data')
+            return bool(found)
+
+        elif m == 'a':
+            self.check_lookups()
+            if entry is not None:
+                self.trace.note_lookup(self.lookups)
+            matched = self.cidrmatch(self.dns_a(arg,self.A), cidrlength)
+            if entry is not None:
+                entry['matched'] = matched
+                entry['stage'] = 'matched' if matched else 'no_match'
+                entry['reason'] = ('connect IP matched a record' if matched
+                                   else 'connect IP did not match a record')
+            return matched
+
+        elif m == 'mx':
+            self.check_lookups()
+            if entry is not None:
+                self.trace.note_lookup(self.lookups)
+            matched = self.cidrmatch(self.dns_mx(arg), cidrlength)
+            if entry is not None:
+                entry['matched'] = matched
+                entry['stage'] = 'matched' if matched else 'no_match'
+                entry['reason'] = ('connect IP matched an MX host' if matched
+                                   else 'connect IP did not match any MX host')
+            return matched
+
+        elif m == 'ip4':
+            matched = False
+            if self.v == 'in-addr': # match own connection type only
+                try:
+                    matched = bool(self.cidrmatch([arg], cidrlength))
+                except socket.error:
+                    raise PermError('syntax error', mech)
+                if entry is not None:
+                    entry['reason'] = ('connect IP matched ip4 network'
+                                       if matched else
+                                       'connect IP outside ip4 network')
+            elif entry is not None:
+                entry['reason'] = 'ip4 not applicable to IPv6 connection'
+            if entry is not None:
+                entry['matched'] = matched
+                entry['stage'] = 'matched' if matched else 'no_match'
+            return matched
+
+        elif m == 'ip6':
+            matched = False
+            if self.v == 'ip6': # match own connection type only
+                try:
+                    matched = bool(self.cidrmatch([arg], cidrlength))
+                except socket.error:
+                    raise PermError('syntax error', mech)
+                if entry is not None:
+                    entry['reason'] = ('connect IP matched ip6 network'
+                                       if matched else
+                                       'connect IP outside ip6 network')
+            elif entry is not None:
+                entry['reason'] = 'ip6 not applicable to IPv4 connection'
+            if entry is not None:
+                entry['matched'] = matched
+                entry['stage'] = 'matched' if matched else 'no_match'
+            return matched
+
+        elif m == 'ptr':
+            self.check_lookups()
+            if entry is not None:
+                self.trace.note_lookup(self.lookups)
+            matched = bool(domainmatch(self.validated_ptrs(), arg))
+            if entry is not None:
+                entry['matched'] = matched
+                entry['stage'] = 'matched' if matched else 'no_match'
+                entry['reason'] = ('validated PTR matched domain' if matched
+                                   else 'validated PTR did not match domain')
+            return matched
+        return False
+
     def check_lookups(self):
         self.lookups = self.lookups + 1
+        if self.trace is not None:
+            self.trace.note_lookup(self.lookups)
         if self.lookups > MAX_LOOKUP*4:
             raise PermError('More than %d DNS lookups'%(MAX_LOOKUP*4))
         if self.lookups > MAX_LOOKUP:
@@ -1348,7 +2021,11 @@ class query(object):
             return []   # invalid DNS name (too long or empty)
         name = name.lower()
         result = self.cache.get( (name, qtype), [])
-        if result: return result
+        if result:
+            if self.trace is not None:
+                self._trace_query(name, qtype, cached=True,
+                                  answers=len(result))
+            return result
         cnamek = (name,'CNAME')
         cname = self.cache.get( cnamek )
 
@@ -1356,30 +2033,49 @@ class query(object):
 
         if cname:
             cname = cname[0]
+            if self.trace is not None:
+                self._trace_query(name, qtype, cached=True, answers=0,
+                                  cname=cname)
         else:
             safe2cache = query.SAFE2CACHE
             if self.querytime < 0:
-                raise TempError('DNS Error: exceeded max query lookup time')
+                err = TempError('DNS Error: exceeded max query lookup time')
+                if self.trace is not None:
+                    self._trace_error(err, 'dns', domain=name, fatal=False,
+                                      query={'name': name, 'qtype': qtype})
+                raise err
             if self.querytime < self.timeout and self.querytime > 0:
                 timeout = self.querytime
             else:
                 timeout = self.timeout
             timethen = time.time()
-            for k, v in DNSLookup(name, qtype, self.strict, timeout):
-                if debug: print('result=',k,v)
-                # Force case insensitivity in cache, DNS servers often
-                # return random case in domain part of answers.
-                k = (k[0].lower(), k[1]) 
-                if k == cnamek:
-                    cname = v
-                    result = self.cache.get( (cname, qtype), [])
-                    if result: break
-                if k[1] == 'CNAME' or (qtype,k[1]) in safe2cache:
-                    if debug: print('addcache=',k,v)
-                    self.cache.setdefault(k, []).append(v)
-                    #if ans and qtype == k[1]:
-                    #    self.cache.setdefault((name,qtype), []).append(v)
+            try:
+                for k, v in DNSLookup(name, qtype, self.strict, timeout):
+                    if debug: print('result=',k,v)
+                    # Force case insensitivity in cache, DNS servers often
+                    # return random case in domain part of answers.
+                    k = (k[0].lower(), k[1])
+                    if k == cnamek:
+                        cname = v
+                        result = self.cache.get( (cname, qtype), [])
+                        if result: break
+                    if k[1] == 'CNAME' or (qtype,k[1]) in safe2cache:
+                        if debug: print('addcache=',k,v)
+                        self.cache.setdefault(k, []).append(v)
+                        #if ans and qtype == k[1]:
+                        #    self.cache.setdefault((name,qtype), []).append(v)
+            except (TempError, PermError, AmbiguityWarning) as x:
+                if self.trace is not None:
+                    self._trace_query(name, qtype, cached=False,
+                                      error=str(x),
+                                      error_type=type(x).__name__)
+                    self._trace_error(x, 'dns', domain=name, fatal=False,
+                                      query={'name': name, 'qtype': qtype})
+                raise
             result = self.cache.get( (name, qtype), [])
+            if self.trace is not None:
+                self._trace_query(name, qtype, cached=False,
+                                  answers=len(result), cname=cname)
             if self.querytime > 0:
                 self.querytime = self.querytime - (time.time()-timethen)
         if not result and cname:
@@ -1397,9 +2093,41 @@ class query(object):
                     self.cache[(name,qtype)] = result
         if not result and not ignore_void:
             self.void_lookups += 1
+            if self.trace is not None:
+                self._trace_void(name, qtype)
             if self.void_lookups > MAX_VOID_LOOKUPS:
-                raise PermError('Void lookup limit of %d exceeded' % MAX_VOID_LOOKUPS)
+                err = PermError('Void lookup limit of %d exceeded' % MAX_VOID_LOOKUPS)
+                if self.trace is not None:
+                    self._trace_error(err, 'dns', domain=name, fatal=False,
+                                      query={'name': name, 'qtype': qtype},
+                                      void_lookups=self.void_lookups)
+                raise err
         return result
+
+    def _trace_query(self, name, qtype, cached, answers=None, **fields):
+        if self.trace is None:
+            return None
+        frame = self.trace.frame
+        fields.setdefault('domain',
+                          frame.get('domain') if frame else
+                          self._trace_safe(self.d))
+        fields.setdefault('frame', frame.get('id') if frame else None)
+        fields.setdefault('frame_path', self.trace.frame_path())
+        mech = self.trace.current_mechanism
+        if mech is not None:
+            fields.setdefault('mechanism_id', mech.get('id'))
+            fields.setdefault('mechanism', mech.get('source'))
+        return self.trace.note_query(self._trace_safe(name), qtype,
+                                     cached=cached, answers=answers, **fields)
+
+    def _trace_void(self, name, qtype):
+        if self.trace is None:
+            return
+        for q in self.trace.queries:
+            if q['name'] == name and q['qtype'] == qtype:
+                q['void'] = True
+                q['void_lookups'] = self.void_lookups
+                return
 
     def cidrmatch(self, ipaddrs, n):
         """Match connect IP against a CIDR network of other IP addresses.

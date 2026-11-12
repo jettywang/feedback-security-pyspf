@@ -114,6 +114,51 @@ The RFC 4408/7208 compliant API::
 The first element in the tuple is one of 'pass', 'fail', 'neutral', 'softfail,
 'permerror', or 'temperror'.  The second is an explanation.
 
+Optional evaluation trace
+-------------------------
+
+Operators sometimes need to explain why a message was authorized or denied.
+Pass ``trace=True`` to ``check2`` or to ``spf.query`` to collect a structured
+record of what the evaluator actually did::
+
+        >>> import spf
+        >>> q = spf.query(i='192.0.2.3', s='user@example.com',
+        ...               h='mx.example.com', trace=True)
+        >>> res, code, exp = q.check()
+        >>> trace = q.trace
+        >>> trace.result, trace.sender_domain
+        ('pass', 'example.com')
+        >>> trace['queries']       # DNS lookups actually attempted
+        [{'name': 'example.com', 'qtype': 'TXT', ...}]
+
+``check2(..., trace=True)`` returns ``(result, explanation, trace)`` instead of
+the usual pair.  ``trace`` is an ``spf.EvaluationTrace`` with JSON-friendly
+``entries``, ``queries``, plus ``result``/``code``/``explanation`` and the
+``sender_domain``.  ``trace.to_dict()``/``trace.to_json()`` export the whole
+record.
+
+Each entry is a dictionary whose ``type`` is one of ``record``, ``mechanism``,
+``modifier``, ``decision``, ``error`` or ``result``.  Records carry the domain
+being evaluated, recursion depth and how it was entered (``top``, ``include``
+or ``redirect``).  Mechanisms record the record domain they belong to, the
+expanded effective domain, whether they matched and why.  Include entries use
+``transform: include`` with the included record's result and the pass/neutral
+normalization; redirect delegation is represented by a ``redirect`` modifier
+with ``delegation: true`` and the delegated result.  Short-circuited directives
+have ``stage: skipped``.  Errors carry their ``phase`` and a ``frame_path``
+pointing at the record that raised them, so loops, temporary DNS failures and
+permanent syntax errors can be attributed to their source.
+
+The trace preserves normal short-circuit evaluation: it never triggers DNS
+queries for branches that were not reached, so ``queries`` only lists lookups
+that were really attempted (including cache hits, marked ``cached``).
+
+Sender identity is sensitive.  By default the trace does not copy the full
+MAIL FROM address, its local part or the HELO name, and macro expansions that
+would embed them are redacted.  Pass ``trace_sender=True`` when the operator
+explicitly needs those details.  With ``trace`` left off (the default), the
+evaluator takes no trace code paths.
+
 For both APIs, the 'h=' parameter is only relevant if the record contains the
 '%{h}' macro. It does not check whether the HELO's record contains the IP.
 
